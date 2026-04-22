@@ -1,5 +1,9 @@
-import { For, Show, createSignal } from 'solid-js'
-import { createMutation, createQuery, useQueryClient } from '@tanstack/solid-query'
+import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
+import {
+  createMutation,
+  createQuery,
+  useQueryClient,
+} from '@tanstack/solid-query'
 import { formatEther, formatUnits } from 'viem'
 import type { Market } from '../lib/api'
 import {
@@ -15,7 +19,6 @@ import {
   USDC_SPENDERS,
   type PlaceOrderArgs,
 } from '../lib/polymarket'
-
 import {
   connect,
   getWalletClient,
@@ -29,11 +32,21 @@ import {
   setupApprovals,
   waitForTx,
 } from '../lib/safeSetup'
-import { fmtNum, fmtUSDFull } from '../lib/format'
+import { fmtNum } from '../lib/format'
+import type { SortedLevel } from '../lib/stream'
 
 type Props = {
   market: Market
+  /** Pre-sorted YES-token order book (best first). Used to compute limit
+   *  auto-fill and market-order fill previews without hitting the network. */
+  bids: () => SortedLevel[]
+  asks: () => SortedLevel[]
 }
+
+/** Default slippage for market orders: 2% (matches humanplane + Polymarket UI). */
+const MARKET_SLIPPAGE = 0.02
+
+type OrderKind = 'market' | 'limit'
 
 export function TradePanel(props: Props) {
   return (
@@ -55,7 +68,7 @@ export function TradePanel(props: Props) {
         </div>
       }
     >
-      <ConnectedTradePanel market={props.market} />
+      <ConnectedTradePanel {...props} />
     </Show>
   )
 }
@@ -65,22 +78,62 @@ function ConnectedTradePanel(props: Props) {
   const funder = () => wallet.funder()!
   const safe = () => wallet.safe()!
 
+  // --- form state -------------------------------------------------------
+  const [kind, setKind] = createSignal<OrderKind>('market')
   const [side, setSide] = createSignal<'BUY' | 'SELL'>('BUY')
+  const [outcomeIdx, setOutcomeIdx] = createSignal(0) // 0 = YES, 1 = NO
+  const [amountStr, setAmountStr] = createSignal('')
   const [priceStr, setPriceStr] = createSignal('')
-  const [sizeStr, setSizeStr] = createSignal('')
   const [postOnly, setPostOnly] = createSignal(false)
   const [submitError, setSubmitError] = createSignal<string | null>(null)
+  const [lastOk, setLastOk] = createSignal<string | null>(null)
 
   const yesToken = () => props.market.clobTokenIds[0]
   const noToken = () => props.market.clobTokenIds[1]
-  const [outcomeIdx, setOutcomeIdx] = createSignal(0) // 0=Yes, 1=No
-
   const tokenId = () => (outcomeIdx() === 0 ? yesToken() : noToken())
   const outcomeLabel = () =>
     props.market.outcomes[outcomeIdx()] ?? (outcomeIdx() === 0 ? 'YES' : 'NO')
 
-  // USDC status — reads from whichever address holds funds in the current
-  // trading mode (EOA in 'eoa' mode, Safe in 'safe' mode).
+  const tickSize = () => props.market.orderPriceMinTickSize ?? 0.01
+  const minSize = () => props.market.orderMinSize ?? (props.market.negRisk ? 1 : 5)
+
+  // --- book views (YES-native, derived for NO) --------------------------
+  //
+  // Polymarket publishes separate books per outcome token, but our SSE
+  // subscription is for the YES token. NO prices are the complement of YES
+  // prices: if someone bids for NO at 40¢ they're implicitly offering to
+  // sell YES at 60¢. For limit-auto-fill this derivation is exact; for
+  // market-order submission the SDK refetches the correct book per token.
+
+  const bidsForOutcome = (): SortedLevel[] => {
+    if (outcomeIdx() === 0) return props.bids()
+    // NO bids ≈ complement of YES asks
+    return props.asks().map((a) => ({ price: 1 - a.price, size: a.size }))
+  }
+  const asksForOutcome = (): SortedLevel[] => {
+    if (outcomeIdx() === 0) return props.asks()
+    return props.bids().map((b) => ({ price: 1 - b.price, size: b.size }))
+  }
+
+  const bestBid = (): number | null =>
+    bidsForOutcome()[0]?.price ?? null
+  const bestAsk = (): number | null =>
+    asksForOutcome()[0]?.price ?? null
+
+  // Auto-fill the limit price when the user first opens the form (or
+  // switches side / outcome), but don't clobber a user-typed value.
+  let userTypedPrice = false
+  createEffect(() => {
+    void side() // re-evaluate on side change
+    void outcomeIdx()
+    void kind()
+    if (userTypedPrice) return
+    if (kind() !== 'limit') return
+    const p = side() === 'BUY' ? bestAsk() : bestBid()
+    if (p != null) setPriceStr((p * 100).toFixed(2))
+  })
+
+  // --- USDC + approvals + safe deployment -------------------------------
   const usdcQuery = createQuery(() => ({
     queryKey: ['usdc-status', wallet.mode(), funder()],
     queryFn: () => fetchUsdcStatus(funder()),
@@ -89,7 +142,6 @@ function ConnectedTradePanel(props: Props) {
     refetchInterval: 30_000,
   }))
 
-  // Safe deployment — only relevant in Safe mode.
   const safeDeployedQuery = createQuery(() => ({
     queryKey: ['safe-deployed', safe()],
     queryFn: () => isSafeDeployed(safe()),
@@ -97,7 +149,6 @@ function ConnectedTradePanel(props: Props) {
     staleTime: 5 * 60_000,
   }))
 
-  // EOA MATIC balance — we need ~0.3 MATIC for the init flow.
   const eoaAddress = () => wallet.eoa()!
   const maticQuery = createQuery(() => ({
     queryKey: ['matic-balance', eoaAddress()],
@@ -107,9 +158,6 @@ function ConnectedTradePanel(props: Props) {
     refetchInterval: 60_000,
   }))
 
-  // CTF ERC-1155 operator approvals — required for SELL orders. Each
-  // exchange needs its own `setApprovalForAll` (neg-risk + adapter only
-  // relevant for neg-risk markets).
   const ctfApprovalsQuery = createQuery(() => ({
     queryKey: ['ctf-approvals', wallet.mode(), funder()],
     queryFn: async () => {
@@ -126,8 +174,6 @@ function ConnectedTradePanel(props: Props) {
     refetchInterval: 120_000,
   }))
 
-  // Only poll for open orders once creds are cached — otherwise each poll
-  // would trigger a fresh L1 signature prompt.
   const openOrdersQuery = createQuery(() => ({
     queryKey: ['open-orders', wallet.mode(), funder(), props.market.conditionId],
     queryFn: () => listOpenOrders({ market: props.market.conditionId }),
@@ -136,100 +182,86 @@ function ConnectedTradePanel(props: Props) {
     refetchInterval: 10_000,
   }))
 
+  // --- mutations --------------------------------------------------------
   const placeMut = createMutation(() => ({
     mutationFn: (args: PlaceOrderArgs) => placeOrder(args),
-    onSuccess: () => {
+    onSuccess: (resp: any) => {
       setSubmitError(null)
-      setPriceStr('')
-      setSizeStr('')
+      setAmountStr('')
+      const id = resp?.orderID ?? resp?.order_id ?? resp?.orderId ?? ''
+      setLastOk(
+        id
+          ? `Order placed · ${shortHash(String(id))}`
+          : 'Order placed'
+      )
       qc.invalidateQueries({ queryKey: ['open-orders'] })
       qc.invalidateQueries({ queryKey: ['usdc-status'] })
     },
-    onError: (e: Error) => setSubmitError(e.message),
+    onError: (e: Error) => {
+      setLastOk(null)
+      setSubmitError(e.message)
+    },
   }))
 
   const cancelMut = createMutation(() => ({
     mutationFn: (id: string) => cancelOrder(id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['open-orders'] })
-    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['open-orders'] }),
   }))
 
-  // --- Init flow --------------------------------------------------------
-  // Safe mode: deploy Safe (if needed) + MultiSend 7 approvals.
-  // EOA mode: one USDC.approve tx per exchange spender (1-3 txs, much simpler).
-
-  const [initStep, setInitStep] = createSignal<
-    null | 'deploying' | 'approving' | string
-  >(null)
-
+  // --- init / approvals flow (unchanged semantics) ----------------------
+  const [initStep, setInitStep] = createSignal<string | null>(null)
   const initMut = createMutation(() => ({
     mutationFn: async () => {
       const wc = getWalletClient()
       if (!wc) throw new Error('wallet not available')
       const eoa = wallet.eoa()!
-      // Snapshot the mode at the start of the mutation. If the user flips
-      // the EOA ↔ Safe toggle mid-flight, we abort rather than submitting
-      // against the wrong funder.
       const modeAtStart = wallet.mode()
       const assertMode = () => {
-        if (wallet.mode() !== modeAtStart) {
+        if (wallet.mode() !== modeAtStart)
           throw new Error('Trading mode changed — please retry')
-        }
       }
 
       if (modeAtStart === 'safe') {
         const s = safe()
         if (!safeDeployedQuery.data) {
-          setInitStep('deploying')
-          const deployHash = await deploySafe(wc, eoa)
-          await waitForTx(deployHash)
+          setInitStep('deploying safe…')
+          await waitForTx(await deploySafe(wc, eoa))
           assertMode()
           await qc.invalidateQueries({ queryKey: ['safe-deployed'] })
         }
-        setInitStep('approving')
-        const approveHash = await setupApprovals(wc, eoa, s)
-        await waitForTx(approveHash)
+        setInitStep('approving…')
+        await waitForTx(await setupApprovals(wc, eoa, s))
         return
       }
 
-      // EOA mode — two-phase approvals:
-      //   Phase 1: USDC.approve for each exchange spender (so BUY works)
-      //   Phase 2: CTF.setApprovalForAll for each exchange (so SELL works)
       const u = usdcQuery.data
       const ctfA = ctfApprovalsQuery.data
-      const usdcTargets: Array<{ name: string; spender: `0x${string}` }> = []
-      if (!u || u.ctfExchange === 0n)
-        usdcTargets.push({ name: 'CTF exchange', spender: USDC_SPENDERS.ctfExchange })
+      const usdcTargets: Array<`0x${string}`> = []
+      if (!u || u.ctfExchange === 0n) usdcTargets.push(USDC_SPENDERS.ctfExchange)
       if (!u || u.negRiskExchange === 0n)
-        usdcTargets.push({ name: 'neg-risk exchange', spender: USDC_SPENDERS.negRiskExchange })
+        usdcTargets.push(USDC_SPENDERS.negRiskExchange)
       if (!u || u.negRiskAdapter === 0n)
-        usdcTargets.push({ name: 'neg-risk adapter', spender: USDC_SPENDERS.negRiskAdapter })
-
-      const ctfTargets: Array<{ name: string; operator: `0x${string}` }> = []
+        usdcTargets.push(USDC_SPENDERS.negRiskAdapter)
+      const ctfTargets: Array<`0x${string}`> = []
       if (!ctfA || !ctfA.ctfExchange)
-        ctfTargets.push({ name: 'CTF exchange (shares)', operator: USDC_SPENDERS.ctfExchange })
+        ctfTargets.push(USDC_SPENDERS.ctfExchange)
       if (!ctfA || !ctfA.negRiskExchange)
-        ctfTargets.push({ name: 'neg-risk exchange (shares)', operator: USDC_SPENDERS.negRiskExchange })
+        ctfTargets.push(USDC_SPENDERS.negRiskExchange)
       if (!ctfA || !ctfA.negRiskAdapter)
-        ctfTargets.push({ name: 'neg-risk adapter (shares)', operator: USDC_SPENDERS.negRiskAdapter })
-
-      const totalSteps = usdcTargets.length + ctfTargets.length
-      let stepNum = 0
-
+        ctfTargets.push(USDC_SPENDERS.negRiskAdapter)
+      const total = usdcTargets.length + ctfTargets.length
+      let n = 0
       for (const t of usdcTargets) {
-        stepNum++
+        n++
         assertMode()
-        setInitStep(`approving USDC ${stepNum}/${totalSteps}`)
-        const hash = await approveUsdcFromEOA(t.spender)
-        await waitForTx(hash)
+        setInitStep(`approving USDC ${n}/${total}`)
+        await waitForTx(await approveUsdcFromEOA(t))
       }
       for (const t of ctfTargets) {
-        stepNum++
+        n++
         assertMode()
-        setInitStep(`approving shares ${stepNum}/${totalSteps}`)
-        const hash = await setCtfApprovalForAllFromEOA(t.operator)
-        await waitForTx(hash)
+        setInitStep(`approving shares ${n}/${total}`)
+        await waitForTx(await setCtfApprovalForAllFromEOA(t))
       }
     },
     onSettled: () => {
@@ -242,24 +274,15 @@ function ConnectedTradePanel(props: Props) {
   }))
 
   const needsInit = () => {
-    if (wallet.mode() === 'safe') {
-      if (safeDeployedQuery.data === false) return true
-    }
+    if (wallet.mode() === 'safe' && safeDeployedQuery.data === false) return true
     const u = usdcQuery.data
     const ctfA = ctfApprovalsQuery.data
     if (!u || !ctfA) return false
-    // Show the init banner if ANY relevant approval is missing, so users
-    // with a partial setup can still complete the remaining steps (OR-gate,
-    // not AND). "Relevant" depends on market type, but we're conservative
-    // and require the full set in EOA mode — that way the Trade tab works
-    // for both binary and neg-risk markets without re-approving.
-    const anyUsdcMissing =
-      u.ctfExchange === 0n ||
-      u.negRiskExchange === 0n ||
-      u.negRiskAdapter === 0n
-    const anyCtfMissing =
+    const anyUsdc =
+      u.ctfExchange === 0n || u.negRiskExchange === 0n || u.negRiskAdapter === 0n
+    const anyCtf =
       !ctfA.ctfExchange || !ctfA.negRiskExchange || !ctfA.negRiskAdapter
-    return anyUsdcMissing || anyCtfMissing
+    return anyUsdc || anyCtf
   }
 
   const hasEnoughMatic = () => {
@@ -267,127 +290,221 @@ function ConnectedTradePanel(props: Props) {
     return b != null && b >= MIN_MATIC_WEI
   }
 
-  const tickSize = () => props.market.orderPriceMinTickSize ?? 0.01
-  const minSize = () => props.market.orderMinSize ?? (props.market.negRisk ? 1 : 5)
-
-  const rawPriceDec = () => {
+  // --- amount / price parsing -------------------------------------------
+  const amount = () => {
+    const n = Number(amountStr())
+    return Number.isFinite(n) ? n : NaN
+  }
+  const priceDec = () => {
     const n = Number(priceStr())
     if (!Number.isFinite(n)) return NaN
-    return n / 100 // UI is in cents, CLOB wants 0-1 decimal
-  }
-  /** Price snapped to the market's tick size (required by CLOB). */
-  const priceDec = () => {
-    const p = rawPriceDec()
-    if (!Number.isFinite(p)) return NaN
     const t = tickSize()
-    return Math.round(p / t) * t
-  }
-  const size = () => Number(sizeStr())
-
-  const totalCost = () => {
-    const p = priceDec()
-    const s = size()
-    if (!Number.isFinite(p) || !Number.isFinite(s)) return 0
-    return p * s
+    return Math.round(n / 100 / t) * t
   }
 
+  // --- market preview (computed locally from live book) -----------------
+  /**
+   * Walk the book to estimate fill. For a market BUY the amount is USDC to
+   * spend; for a market SELL it's shares. Returns the average and worst
+   * fill prices plus filled shares (BUY) or USDC received (SELL).
+   */
+  const marketPreview = createMemo<null | {
+    avgPrice: number
+    worstPrice: number
+    fillable: number // shares (BUY) or USDC (SELL)
+    partial: boolean
+  }>(() => {
+    if (kind() !== 'market') return null
+    const a = amount()
+    if (!Number.isFinite(a) || a <= 0) return null
+    const isBuy = side() === 'BUY'
+    const levels = isBuy ? asksForOutcome() : bidsForOutcome()
+    if (!levels.length) return null
+
+    let remainingUSDC = isBuy ? a : 0
+    let remainingShares = isBuy ? 0 : a
+    let filledShares = 0
+    let filledUSDC = 0
+    let worst = 0
+    for (const lvl of levels) {
+      const levelSize = lvl.size // shares at this price
+      if (isBuy) {
+        const cost = levelSize * lvl.price
+        const spend = Math.min(remainingUSDC, cost)
+        if (spend <= 0) break
+        filledShares += spend / lvl.price
+        filledUSDC += spend
+        remainingUSDC -= spend
+        worst = lvl.price
+        if (remainingUSDC <= 0) break
+      } else {
+        const takeShares = Math.min(remainingShares, levelSize)
+        if (takeShares <= 0) break
+        filledShares += takeShares
+        filledUSDC += takeShares * lvl.price
+        remainingShares -= takeShares
+        worst = lvl.price
+        if (remainingShares <= 0) break
+      }
+    }
+    if (filledShares === 0) return null
+    const avgPrice = filledUSDC / filledShares
+    const partial = isBuy ? remainingUSDC > 0.001 : remainingShares > 0.001
+    return {
+      avgPrice,
+      worstPrice: worst,
+      fillable: isBuy ? filledShares : filledUSDC,
+      partial,
+    }
+  })
+
+  /** Slippage-protected price submitted with market orders. */
+  const marketWorstPrice = (): number | null => {
+    const mp = marketPreview()
+    if (!mp) return null
+    const raw =
+      side() === 'BUY'
+        ? mp.avgPrice * (1 + MARKET_SLIPPAGE)
+        : mp.avgPrice * (1 - MARKET_SLIPPAGE)
+    // Clamp to tick + [tick, 1-tick]
+    const t = tickSize()
+    const snapped = Math.round(raw / t) * t
+    const max = 1 - t
+    return Math.max(t, Math.min(max, snapped))
+  }
+
+  // --- submit -----------------------------------------------------------
   const validation = (): string | null => {
-    const p = priceDec()
-    const s = size()
-    if (!Number.isFinite(p) || p <= 0 || p >= 1)
-      return 'price must be between 0 and 100¢'
-    if (!Number.isFinite(s) || s < minSize())
-      return `size must be ≥ ${minSize()}`
     if (!wallet.onPolygon()) return 'wallet must be on Polygon'
+    const a = amount()
+    if (!Number.isFinite(a) || a <= 0) return 'enter an amount'
+
+    if (kind() === 'limit') {
+      const p = priceDec()
+      if (!Number.isFinite(p) || p <= 0 || p >= 1)
+        return 'price must be between 0 and 100¢'
+      if (a < minSize()) return `size must be ≥ ${minSize()} shares`
+    } else {
+      // Market mode: for BUY `a` is USDC; for SELL `a` is shares.
+      if (side() === 'SELL' && a < minSize())
+        return `size must be ≥ ${minSize()} shares`
+      const mp = marketPreview()
+      if (!mp || mp.fillable <= 0) return 'no liquidity at this size'
+      if (mp.partial) return 'not enough book depth for this size'
+    }
+
+    // USDC balance check on BUY orders.
     if (side() === 'BUY') {
-      // Integer-safe USDC comparison (USDC has 6 decimals).
-      const needed =
-        BigInt(Math.round(priceDec() * 1_000_000)) *
-        BigInt(Math.max(1, Math.floor(s)))
+      const needUsdc =
+        kind() === 'market' ? a : priceDec() * a
+      const needed = BigInt(Math.round(needUsdc * 1_000_000))
       if (usdcQuery.data && usdcQuery.data.balance < needed) {
-        return `insufficient USDC (have ${formatUnits(usdcQuery.data.balance, 6)})`
+        return `insufficient USDC (have ${Number(formatUnits(usdcQuery.data.balance, 6)).toFixed(2)})`
       }
     }
     return null
   }
 
   const submit = () => {
+    setLastOk(null)
     const v = validation()
     if (v) {
       setSubmitError(v)
       return
     }
     setSubmitError(null)
-    placeMut.mutate({
-      tokenId: tokenId()!,
-      side: side(),
-      price: priceDec(),
-      size: size(),
-      tickSize: tickSize(),
-      negRisk: props.market.negRisk,
-      orderType: 'GTC',
-      postOnly: postOnly(),
-    })
-  }
-
-  /** Allowance against the exchange this specific market trades through. */
-  const exchangeAllowance = (): bigint => {
-    const u = usdcQuery.data
-    if (!u) return 0n
-    if (props.market.negRisk) {
-      // Neg-risk trading requires allowance on the neg-risk exchange AND the
-      // adapter — the binding constraint is the smaller of the two.
-      return u.negRiskExchange < u.negRiskAdapter
-        ? u.negRiskExchange
-        : u.negRiskAdapter
+    const a = amount()
+    if (kind() === 'limit') {
+      placeMut.mutate({
+        tokenId: tokenId()!,
+        side: side(),
+        price: priceDec(),
+        size: a,
+        tickSize: tickSize(),
+        negRisk: props.market.negRisk,
+        orderType: 'GTC',
+        postOnly: postOnly(),
+      })
+    } else {
+      // Market order — FAK (fill-and-kill; partial fills allowed).
+      // For BUY the SDK expects `size` to represent the USDC amount; for
+      // SELL it's shares. Our placeOrder() already handles this.
+      placeMut.mutate({
+        tokenId: tokenId()!,
+        side: side(),
+        price: marketWorstPrice()!,
+        size: a,
+        tickSize: tickSize(),
+        negRisk: props.market.negRisk,
+        orderType: 'FAK',
+      })
     }
-    return u.ctfExchange
   }
 
-  /**
-   * Only warn about approvals when the user *would actually be blocked* by
-   * the current trade size. Previously we compared against an arbitrary 1M-
-   * USDC threshold which fired for anyone with less than `MaxUint256`.
-   *
-   * For SELL orders we don't need USDC allowance at all (proceeds flow in),
-   * but the CTF ERC1155 setApprovalForAll is a separate requirement — we
-   * can't read that without an extra RPC call, so we defer signalling for
-   * SELLs and let the CLOB reject with a clear error.
-   */
-  const approvalShortfall = (): bigint | null => {
-    if (side() === 'SELL') return null
-    const costRaw = BigInt(
-      Math.round((Number.isFinite(totalCost()) ? totalCost() : 0) * 1_000_000)
-    )
-    if (costRaw === 0n) return null
-    const have = exchangeAllowance()
-    return have < costRaw ? costRaw - have : null
+  // --- presets ----------------------------------------------------------
+  const amountLabel = () =>
+    kind() === 'market' && side() === 'BUY' ? 'USDC' : 'shares'
+  const amountUnit = () =>
+    kind() === 'market' && side() === 'BUY' ? '$' : ''
+
+  const presets = () =>
+    kind() === 'market' && side() === 'BUY'
+      ? [5, 10, 50, 100] // USDC
+      : [10, 50, 100, 500] // shares
+
+  const submitLabel = () => {
+    const a = amount()
+    if (kind() === 'market') {
+      const mp = marketPreview()
+      if (mp && Number.isFinite(a)) {
+        const sharesStr =
+          side() === 'BUY'
+            ? fmtNum(mp.fillable)
+            : fmtNum(a)
+        const avg = (mp.avgPrice * 100).toFixed(1)
+        return `${side()} ${sharesStr} ${outcomeLabel()} @ ~${avg}¢`
+      }
+      return `${side()} at market`
+    }
+    if (!Number.isFinite(a) || a <= 0) return `${side()} ${outcomeLabel()} (limit)`
+    const total = a * priceDec()
+    return `${side()} ${fmtNum(a)} ${outcomeLabel()} @ ${(priceDec() * 100).toFixed(1)}¢ · $${total.toFixed(2)}`
   }
 
   return (
     <div class="flex h-full flex-col overflow-y-auto">
-      {/* Trading mode toggle — which address funds trades. */}
-      <div class="flex h-8 shrink-0 items-center justify-between border-b border-border-2 px-4 eyebrow">
+      {/* Mode toggle (EOA / Safe) */}
+      <div class="flex h-7 shrink-0 items-center justify-between border-b border-border-2 px-4 eyebrow">
         <span>funds on</span>
         <div class="segmented">
           <button
             data-active={wallet.mode() === 'eoa'}
             onClick={() => setTradingMode('eoa')}
-            title="Trade from your EOA directly"
           >
             EOA
           </button>
           <button
             data-active={wallet.mode() === 'safe'}
             onClick={() => setTradingMode('safe')}
-            title="Trade from your Polymarket Safe (polymarket.com default)"
           >
             Safe
           </button>
         </div>
       </div>
 
-      {/* Initialize flow — branches by mode. */}
+      {/* USDC + allowance */}
+      <div class="border-b border-border-2 px-4 py-2.5">
+        <div class="flex items-center justify-between eyebrow">
+          <span>USDC balance</span>
+          <Show when={usdcQuery.data} fallback={<span>—</span>}>
+            <span class="tabular-nums text-text-bright normal-case tracking-normal">
+              ${Number(formatUnits(usdcQuery.data!.balance, 6)).toFixed(2)}
+            </span>
+          </Show>
+        </div>
+      </div>
+
+      {/* Init banner */}
       <Show when={needsInit()}>
         <div class="border-b border-border-3 bg-panel-2 p-3">
           <div class="eyebrow text-text-bright">initialize trading</div>
@@ -396,12 +513,11 @@ function ConnectedTradePanel(props: Props) {
               when={wallet.mode() === 'eoa'}
               fallback={
                 safeDeployedQuery.data === false
-                  ? 'Deploy your Polymarket Safe, then approve USDC + CTF spending. One-time setup, ~0.2 MATIC.'
-                  : 'Approve USDC + CTF spending via your Safe. One-time, ~0.15 MATIC.'
+                  ? 'Deploy your Safe then approve spending (~0.2 MATIC, 2 txs).'
+                  : 'Approve USDC + CTF via your Safe (~0.15 MATIC, 1 tx).'
               }
             >
-              Approve USDC spending directly from your EOA. Up to 3 quick
-              approvals (1 per exchange). ~0.01 MATIC each.
+              Approve USDC + CTF spending from your EOA. Up to 6 quick txs.
             </Show>
           </p>
           <Show
@@ -414,8 +530,8 @@ function ConnectedTradePanel(props: Props) {
                     ? Number(formatEther(maticQuery.data)).toFixed(4)
                     : '—'}
                 </span>{' '}
-                MATIC on your EOA ({wallet.eoa()?.slice(0, 6)}…). Send ~0.3
-                MATIC to this address to continue.
+                MATIC. Send ~0.3 MATIC to {wallet.eoa()?.slice(0, 6)}… on
+                Polygon to continue.
               </div>
             }
           >
@@ -424,13 +540,7 @@ function ConnectedTradePanel(props: Props) {
               disabled={initMut.isPending}
               class="mt-2 h-8 w-full cursor-pointer border border-text-bright bg-text-bright text-[11px] font-semibold uppercase tracking-[0.14em] text-bg hover:bg-text hover:border-text disabled:opacity-60"
             >
-              {initStep() ?? (
-                wallet.mode() === 'eoa'
-                  ? 'approve USDC'
-                  : safeDeployedQuery.data === false
-                    ? 'initialize (2 txs)'
-                    : 'approve (1 tx)'
-              )}
+              {initStep() ?? 'initialize trading'}
             </button>
           </Show>
           <Show when={initMut.error}>
@@ -441,68 +551,51 @@ function ConnectedTradePanel(props: Props) {
         </div>
       </Show>
 
-      {/* USDC + allowance status */}
-      <div class="border-b border-border-2 px-4 py-3">
-        <div class="flex items-center justify-between eyebrow">
-          <span>USDC balance</span>
-          <Show when={usdcQuery.data} fallback={<span>—</span>}>
-            <span class="tabular-nums text-text-bright normal-case tracking-normal">
-              ${Number(formatUnits(usdcQuery.data!.balance, 6)).toFixed(2)}
-            </span>
-          </Show>
+      {/* Order type */}
+      <div class="flex h-8 shrink-0 items-center justify-between border-b border-border-2 px-4 eyebrow">
+        <span>type</span>
+        <div class="segmented">
+          <button
+            data-active={kind() === 'market'}
+            onClick={() => {
+              userTypedPrice = false
+              setKind('market')
+            }}
+          >
+            Market
+          </button>
+          <button
+            data-active={kind() === 'limit'}
+            onClick={() => {
+              userTypedPrice = false
+              setKind('limit')
+            }}
+          >
+            Limit
+          </button>
         </div>
-        <Show when={usdcQuery.data}>
-          <div class="mt-1 flex items-center justify-between eyebrow">
-            <span>allowance</span>
-            <span class="tabular-nums text-text normal-case tracking-normal">
-              <Show
-                when={
-                  exchangeAllowance() > BigInt('1000000000000000000000000')
-                }
-                fallback={
-                  <>${Number(formatUnits(exchangeAllowance(), 6)).toFixed(2)}</>
-                }
-              >
-                ∞
-              </Show>
-            </span>
-          </div>
-        </Show>
-        <Show when={approvalShortfall() != null}>
-          <div class="mt-2 border border-down/60 p-2 text-[10px] leading-snug text-down">
-            This trade needs ${(
-              Number(formatUnits(approvalShortfall()!, 6))
-            ).toFixed(2)} more USDC approved
-            {props.market.negRisk ? ' (neg-risk exchange + adapter)' : ''}.{' '}
-            Polymarket's approvals are Safe-exec transactions relayed via their
-            backend —{' '}
-            <a
-              href={`https://polymarket.com/markets/${props.market.slug}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="underline hover:text-text-bright"
-            >
-              open on polymarket.com
-            </a>{' '}
-            once to set them up (done in-wallet, takes one signature).
-          </div>
-        </Show>
       </div>
 
-      {/* Outcome selector (only meaningful for binary markets) */}
-      <div class="flex h-8 shrink-0 items-center gap-3 border-b border-border-2 px-4 eyebrow">
+      {/* Outcome */}
+      <div class="flex h-8 shrink-0 items-center justify-between border-b border-border-2 px-4 eyebrow">
         <span>outcome</span>
         <div class="segmented">
           <button
             data-active={outcomeIdx() === 0}
-            onClick={() => setOutcomeIdx(0)}
+            onClick={() => {
+              userTypedPrice = false
+              setOutcomeIdx(0)
+            }}
           >
             {props.market.outcomes[0] ?? 'Yes'}
           </button>
           <Show when={noToken()}>
             <button
               data-active={outcomeIdx() === 1}
-              onClick={() => setOutcomeIdx(1)}
+              onClick={() => {
+                userTypedPrice = false
+                setOutcomeIdx(1)
+              }}
             >
               {props.market.outcomes[1] ?? 'No'}
             </button>
@@ -510,94 +603,171 @@ function ConnectedTradePanel(props: Props) {
         </div>
       </div>
 
-      {/* Side toggle */}
-      <div class="flex h-8 shrink-0 items-center justify-between border-b border-border-2 px-4 eyebrow">
-        <span>side</span>
-        <div class="segmented">
-          <button data-active={side() === 'BUY'} onClick={() => setSide('BUY')}>
-            Buy
-          </button>
-          <button
-            data-active={side() === 'SELL'}
-            onClick={() => setSide('SELL')}
+      {/* Side */}
+      <div class="flex h-9 shrink-0 items-center gap-2 border-b border-border-2 px-4">
+        <button
+          data-active={side() === 'BUY'}
+          onClick={() => {
+            userTypedPrice = false
+            setSide('BUY')
+          }}
+          class={
+            'h-7 flex-1 cursor-pointer border text-[11px] font-semibold uppercase tracking-[0.14em] ' +
+            (side() === 'BUY'
+              ? 'border-up bg-up/15 text-up'
+              : 'border-border-2 text-text-dim hover:text-text-bright')
+          }
+        >
+          Buy
+        </button>
+        <button
+          data-active={side() === 'SELL'}
+          onClick={() => {
+            userTypedPrice = false
+            setSide('SELL')
+          }}
+          class={
+            'h-7 flex-1 cursor-pointer border text-[11px] font-semibold uppercase tracking-[0.14em] ' +
+            (side() === 'SELL'
+              ? 'border-down bg-down/15 text-down'
+              : 'border-border-2 text-text-dim hover:text-text-bright')
+          }
+        >
+          Sell
+        </button>
+      </div>
+
+      {/* Amount */}
+      <div class="border-b border-border-2 px-4 py-3">
+        <div class="flex items-end justify-between eyebrow">
+          <span>{amountLabel()}</span>
+          <Show
+            when={kind() === 'limit' && Number.isFinite(priceDec()) && amount() > 0}
           >
-            Sell
-          </button>
-        </div>
-      </div>
-
-      {/* Price + size */}
-      <div class="grid shrink-0 grid-cols-2 gap-0 border-b border-border-2">
-        <label class="flex flex-col border-r border-border-2 px-4 py-3">
-          <span class="eyebrow">price ¢</span>
-          <input
-            type="number"
-            step="0.1"
-            min="0"
-            max="100"
-            placeholder="50.0"
-            value={priceStr()}
-            onInput={(e) => setPriceStr(e.currentTarget.value)}
-            class="mt-1 bg-transparent tabular-nums text-[15px] font-semibold text-text-bright outline-none placeholder:text-text-dimmer"
-          />
-        </label>
-        <label class="flex flex-col px-4 py-3">
-          <span class="eyebrow">shares</span>
-          <input
-            type="number"
-            step="1"
-            min="1"
-            placeholder="100"
-            value={sizeStr()}
-            onInput={(e) => setSizeStr(e.currentTarget.value)}
-            class="mt-1 bg-transparent tabular-nums text-[15px] font-semibold text-text-bright outline-none placeholder:text-text-dimmer"
-          />
-        </label>
-      </div>
-
-      {/* Totals + post-only */}
-      <div class="flex h-8 shrink-0 items-center justify-between border-b border-border-2 px-4 eyebrow">
-        <label class="flex cursor-pointer items-center gap-2">
-          <input
-            type="checkbox"
-            checked={postOnly()}
-            onChange={(e) => setPostOnly(e.currentTarget.checked)}
-          />
-          <span>post-only</span>
-        </label>
-        <div class="flex items-center gap-3 normal-case tracking-normal">
-          <Show when={Number.isFinite(priceDec()) && priceDec() > 0}>
-            <span class="text-text-dim">
-              snap{' '}
-              <span class="tabular-nums text-text-bright">
-                {(priceDec() * 100).toFixed(2)}¢
-              </span>
+            <span class="tabular-nums text-text normal-case tracking-normal">
+              cost ${(amount() * priceDec()).toFixed(2)}
             </span>
           </Show>
-          <span class="tabular-nums text-text-bright">
-            total {fmtUSDFull(totalCost())}
-          </span>
+        </div>
+        <div class="mt-1 flex items-center gap-2">
+          <Show when={amountUnit()}>
+            <span class="text-[20px] text-text-dim">{amountUnit()}</span>
+          </Show>
+          <input
+            type="number"
+            inputmode="decimal"
+            step="any"
+            min="0"
+            placeholder="0"
+            value={amountStr()}
+            onInput={(e) => setAmountStr(e.currentTarget.value)}
+            class="flex-1 bg-transparent tabular-nums text-[20px] font-semibold text-text-bright outline-none placeholder:text-text-dimmer"
+          />
+        </div>
+        <div class="mt-2 flex gap-1.5">
+          <For each={presets()}>
+            {(p) => (
+              <button
+                onClick={() => setAmountStr(String(p))}
+                class="flex-1 border border-border-2 bg-transparent py-1 text-[10px] tabular-nums text-text-dim hover:border-border-3 hover:text-text-bright"
+              >
+                {kind() === 'market' && side() === 'BUY' ? `$${p}` : p}
+              </button>
+            )}
+          </For>
         </div>
       </div>
+
+      {/* Price (limit only) */}
+      <Show when={kind() === 'limit'}>
+        <div class="border-b border-border-2 px-4 py-3">
+          <div class="flex items-end justify-between eyebrow">
+            <span>price (¢)</span>
+            <Show when={bestBid() != null && bestAsk() != null}>
+              <span class="tabular-nums text-text-dim normal-case tracking-normal">
+                bid {(bestBid()! * 100).toFixed(2)}¢ · ask{' '}
+                {(bestAsk()! * 100).toFixed(2)}¢
+              </span>
+            </Show>
+          </div>
+          <input
+            type="number"
+            inputmode="decimal"
+            step={String(tickSize() * 100)}
+            min="0"
+            max="100"
+            placeholder="50.00"
+            value={priceStr()}
+            onInput={(e) => {
+              userTypedPrice = true
+              setPriceStr(e.currentTarget.value)
+            }}
+            class="mt-1 w-full bg-transparent tabular-nums text-[20px] font-semibold text-text-bright outline-none placeholder:text-text-dimmer"
+          />
+          <label class="mt-2 flex cursor-pointer items-center gap-2 eyebrow">
+            <input
+              type="checkbox"
+              checked={postOnly()}
+              onChange={(e) => setPostOnly(e.currentTarget.checked)}
+            />
+            <span>post-only (maker-only, no crossing)</span>
+          </label>
+        </div>
+      </Show>
+
+      {/* Market preview (market only) */}
+      <Show when={kind() === 'market' && marketPreview()}>
+        {(_mp) => {
+          const mp = marketPreview()!
+          return (
+            <div class="border-b border-border-2 px-4 py-2.5 eyebrow">
+              <div class="flex items-center justify-between">
+                <span>est. fill</span>
+                <span class="tabular-nums text-text-bright normal-case tracking-normal">
+                  {side() === 'BUY'
+                    ? `${fmtNum(mp.fillable)} shares`
+                    : `$${mp.fillable.toFixed(2)}`}{' '}
+                  @ {(mp.avgPrice * 100).toFixed(2)}¢ avg
+                </span>
+              </div>
+              <div class="mt-1 flex items-center justify-between text-text-dim normal-case tracking-normal">
+                <span>slippage cap</span>
+                <span class="tabular-nums">
+                  {MARKET_SLIPPAGE * 100}% · worst{' '}
+                  {marketWorstPrice() != null
+                    ? `${(marketWorstPrice()! * 100).toFixed(2)}¢`
+                    : '—'}
+                </span>
+              </div>
+              <Show when={mp.partial}>
+                <div class="mt-1 text-down normal-case tracking-normal">
+                  partial fill — reduce size or switch to limit
+                </div>
+              </Show>
+            </div>
+          )
+        }}
+      </Show>
 
       {/* Submit */}
       <div class="shrink-0 border-b border-border-2 px-4 py-3">
         <button
           onClick={submit}
-          disabled={placeMut.isPending}
+          disabled={placeMut.isPending || needsInit()}
           class={
-            'h-9 w-full cursor-pointer border text-[12px] font-semibold uppercase tracking-[0.14em] disabled:opacity-60 ' +
+            'h-11 w-full cursor-pointer border text-[12px] font-semibold uppercase tracking-[0.14em] disabled:opacity-60 ' +
             (side() === 'BUY'
-              ? 'border-up/60 bg-up/10 text-up hover:bg-up/20'
-              : 'border-down/60 bg-down/10 text-down hover:bg-down/20')
+              ? 'border-up bg-up/15 text-up hover:bg-up/25'
+              : 'border-down bg-down/15 text-down hover:bg-down/25')
           }
         >
-          {placeMut.isPending
-            ? 'signing…'
-            : `${side()} ${outcomeLabel()}`}
+          {placeMut.isPending ? 'signing…' : submitLabel()}
         </button>
         <Show when={submitError()}>
           <div class="mt-2 text-[10px] text-down">{submitError()}</div>
+        </Show>
+        <Show when={lastOk()}>
+          <div class="mt-2 text-[10px] text-up">{lastOk()}</div>
         </Show>
       </div>
 
@@ -605,9 +775,7 @@ function ConnectedTradePanel(props: Props) {
       <div class="flex min-h-0 flex-col">
         <div class="flex h-7 shrink-0 items-center justify-between border-b border-border px-4 eyebrow">
           <span>open orders</span>
-          <span class="tabular-nums">
-            {openOrdersQuery.data?.length ?? 0}
-          </span>
+          <span class="tabular-nums">{openOrdersQuery.data?.length ?? 0}</span>
         </div>
         <Show
           when={!openOrdersQuery.isLoading}
@@ -619,9 +787,7 @@ function ConnectedTradePanel(props: Props) {
           >
             <For each={openOrdersQuery.data}>
               {(o: any) => {
-                // SDK responses vary between id / order_id / orderId; accept all.
-                const oid = (): string =>
-                  o.id ?? o.order_id ?? o.orderId ?? ''
+                const oid = (): string => o.id ?? o.order_id ?? o.orderId ?? ''
                 return (
                   <div class="grid grid-cols-[48px_1fr_1fr_60px] items-center gap-3 border-b border-border px-4 py-2 text-[11px]">
                     <span
@@ -658,4 +824,9 @@ function ConnectedTradePanel(props: Props) {
       </div>
     </div>
   )
+}
+
+function shortHash(h: string) {
+  if (!h) return ''
+  return h.length > 12 ? `${h.slice(0, 6)}…${h.slice(-4)}` : h
 }

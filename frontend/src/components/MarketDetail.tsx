@@ -314,7 +314,11 @@ export function MarketDetail(props: Props) {
               <TopHolders market={props.market} />
             </Show>
             <Show when={rightTab() === 'trade'}>
-              <TradePanel market={props.market} />
+              <TradePanel
+                market={props.market}
+                bids={bidsView}
+                asks={asksView}
+              />
             </Show>
           </div>
         </div>
