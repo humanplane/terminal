@@ -1,6 +1,6 @@
 import { Show, createSignal, onCleanup, onMount } from 'solid-js'
 import { useNavigate } from '@solidjs/router'
-import { connect, disconnect, shortAddr, wallet } from '../lib/wallet'
+import { connect, disconnect, setTradingMode, shortAddr, wallet } from '../lib/wallet'
 
 export function WalletButton() {
   const navigate = useNavigate()
@@ -76,15 +76,36 @@ export function WalletButton() {
                 {wallet.safe()}
               </div>
             </div>
+            <div class="border-b border-border-2 px-3 py-2 eyebrow">
+              view positions
+            </div>
             <button
               onClick={() => {
                 setOpen(false)
+                if (wallet.mode() !== 'eoa') setTradingMode('eoa')
+                const e = wallet.eoa()
+                if (e) navigate(`/trader/${e}`)
+              }}
+              class={
+                'block w-full border-b border-border-2 px-3 py-2 text-left text-[11px] hover:bg-panel-2 ' +
+                (wallet.mode() === 'eoa' ? 'text-text-bright' : 'text-text')
+              }
+            >
+              EOA {wallet.mode() === 'eoa' ? '· active' : ''} →
+            </button>
+            <button
+              onClick={() => {
+                setOpen(false)
+                if (wallet.mode() !== 'safe') setTradingMode('safe')
                 const s = wallet.safe()
                 if (s) navigate(`/trader/${s}`)
               }}
-              class="block w-full border-b border-border-2 px-3 py-2 text-left text-[11px] text-text-bright hover:bg-panel-2"
+              class={
+                'block w-full border-b border-border-2 px-3 py-2 text-left text-[11px] hover:bg-panel-2 ' +
+                (wallet.mode() === 'safe' ? 'text-text-bright' : 'text-text')
+              }
             >
-              View my positions →
+              Polymarket Safe {wallet.mode() === 'safe' ? '· active' : ''} →
             </button>
             <button
               onClick={() => {
