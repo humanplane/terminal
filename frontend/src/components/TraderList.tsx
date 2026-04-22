@@ -155,9 +155,20 @@ function InfiniteTrigger(props: {
 }) {
   let el!: HTMLDivElement
   onMount(() => {
+    // Disconnect+re-observe after each firing. Otherwise IO doesn't re-fire
+    // when the sentinel stays in view during a fetch (fast connection or
+    // short result set) — load-more stalls until the user scrolls.
     const io = new IntersectionObserver(
       (entries) => {
-        for (const e of entries) if (e.isIntersecting) props.onVisible()
+        for (const e of entries) {
+          if (e.isIntersecting) {
+            io.disconnect()
+            props.onVisible()
+            // Re-observe on the next microtask so the fresh layout after the
+            // callback settles before we check intersection again.
+            queueMicrotask(() => io.observe(el))
+          }
+        }
       },
       { threshold: 0.01 }
     )

@@ -92,10 +92,15 @@ function TradeLine(props: { t: UserTrade }) {
 
 function fmtRelative(ts: number) {
   if (!ts) return '—'
-  const ms = ts * 1000 - Date.now()
-  const abs = Math.abs(ms)
-  if (abs < 60_000) return `${Math.max(1, Math.round(abs / 1000))}s`
-  if (abs < 3_600_000) return `${Math.round(abs / 60_000)}m`
-  if (abs < 86_400_000) return `${Math.round(abs / 3_600_000)}h`
-  return `${Math.round(abs / 86_400_000)}d`
+  // Polymarket timestamps are UNIX seconds. Positive delta = future,
+  // negative = past. For the tape column we pack the sign/suffix tightly.
+  const diff = Date.now() - ts * 1000
+  const abs = Math.abs(diff)
+  const suffix = diff >= 0 ? '' : ' (future)'
+  let unit: string
+  if (abs < 60_000) unit = `${Math.max(1, Math.round(abs / 1000))}s`
+  else if (abs < 3_600_000) unit = `${Math.round(abs / 60_000)}m`
+  else if (abs < 86_400_000) unit = `${Math.round(abs / 3_600_000)}h`
+  else unit = `${Math.round(abs / 86_400_000)}d`
+  return unit + suffix
 }

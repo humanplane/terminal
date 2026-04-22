@@ -52,7 +52,18 @@ export const NEG_RISK_ADAPTER: Address = getAddress(
 )
 
 /** Polymarket signature types (as defined by their CLOB client). */
+export const SIGNATURE_TYPE_EOA = 0 as const
 export const SIGNATURE_TYPE_SAFE = 2 as const
+
+/**
+ * Trading mode: where the user's USDC lives and who signs orders.
+ *   - 'eoa': signer == funder == EOA. Direct trading. Single USDC.approve
+ *           from the EOA; no Safe involved.
+ *   - 'safe': signer == EOA, funder == derived Polymarket Safe. Required if
+ *           you onboarded via polymarket.com (they deposit USDC to the Safe).
+ */
+export type TradingMode = 'eoa' | 'safe'
+const LS_MODE_KEY = 'humanplane:wallet:mode:v1'
 
 /**
  * Canonical Gnosis Safe MultiSendCallOnly v1.3.0 on Polygon.
@@ -70,14 +81,25 @@ type WalletState = {
   /** Polymarket Safe (proxy) address — what `/api/user/:addr/*` expects. */
   safe: Address | null
   chainId: number | null
+  mode: TradingMode
   connecting: boolean
   error: string | null
+}
+
+function loadInitialMode(): TradingMode {
+  try {
+    const m = localStorage.getItem(LS_MODE_KEY)
+    return m === 'safe' ? 'safe' : 'eoa'
+  } catch {
+    return 'eoa'
+  }
 }
 
 const [state, setState] = createSignal<WalletState>({
   eoa: null,
   safe: null,
   chainId: null,
+  mode: loadInitialMode(),
   connecting: false,
   error: null,
 })
@@ -86,10 +108,28 @@ export const wallet = {
   state,
   eoa: () => state().eoa,
   safe: () => state().safe,
+  mode: () => state().mode,
+  /**
+   * The "funder" for Polymarket: where the USDC lives.
+   * EOA mode → EOA, Safe mode → derived Safe.
+   */
+  funder: (): Address | null =>
+    state().mode === 'eoa' ? state().eoa : state().safe,
   isConnected: () => state().eoa != null,
   onPolygon: () => state().chainId === polygon.id,
   isConnecting: () => state().connecting,
   error: () => state().error,
+}
+
+export function setTradingMode(mode: TradingMode) {
+  try {
+    localStorage.setItem(LS_MODE_KEY, mode)
+  } catch {
+    /* noop */
+  }
+  // Invalidate any cached ClobClient — funder + signatureType change.
+  import('./polymarket').then((m) => m.invalidateClobClient())
+  setState((s) => ({ ...s, mode }))
 }
 
 /** ----- Address derivation -------------------------------------------- */
@@ -139,7 +179,14 @@ export async function connect(): Promise<void> {
 
     const safe = deriveSafeAddress(eoa)
     localStorage.setItem(LS_EOA_KEY, eoa)
-    setState({ eoa, safe, chainId, connecting: false, error: null })
+    setState((s) => ({
+      ...s,
+      eoa,
+      safe,
+      chainId,
+      connecting: false,
+      error: null,
+    }))
 
     provider.removeListener?.('accountsChanged', onAccountsChanged)
     provider.removeListener?.('chainChanged', onChainChanged)
@@ -155,12 +202,12 @@ export async function connect(): Promise<void> {
 }
 
 function onAccountsChanged(accounts: string[]) {
-  // Clear cached Polymarket credentials for the previous safe — the new EOA
-  // has its own Safe + creds and must re-derive. Also drop the cached
-  // ClobClient so the next call rebuilds with the fresh signer.
-  const prevSafe = state().safe
+  // Clear cached Polymarket credentials for the previous EOA — creds are
+  // keyed by (eoa, funder, sigType), so we nuke all of them for that EOA.
+  // Also drop the cached ClobClient so the next call rebuilds.
+  const prevEoa = state().eoa
   import('./polymarket').then((m) => {
-    if (prevSafe) m.clearCreds(prevSafe)
+    if (prevEoa) m.clearCreds(prevEoa)
     m.invalidateClobClient()
   })
 
@@ -183,19 +230,20 @@ function onChainChanged(hex: string) {
 }
 
 export function disconnect() {
-  const prevSafe = state().safe
+  const prevEoa = state().eoa
   import('./polymarket').then((m) => {
-    if (prevSafe) m.clearCreds(prevSafe)
+    if (prevEoa) m.clearCreds(prevEoa)
     m.invalidateClobClient()
   })
   localStorage.removeItem(LS_EOA_KEY)
-  setState({
+  setState((s) => ({
+    ...s,
     eoa: null,
     safe: null,
     chainId: null,
     connecting: false,
     error: null,
-  })
+  }))
 }
 
 /** Silent auto-reconnect on app boot if wallet was previously authorized. */
@@ -213,13 +261,14 @@ export function initWalletAutoReconnect() {
       const eoa = getAddress(accounts[0])
       if (eoa.toLowerCase() !== prev.toLowerCase()) return
       const chainIdHex = await provider.request({ method: 'eth_chainId' })
-      setState({
+      setState((s) => ({
+        ...s,
         eoa,
         safe: deriveSafeAddress(eoa),
         chainId: parseInt(chainIdHex, 16),
         connecting: false,
         error: null,
-      })
+      }))
       provider.on?.('accountsChanged', onAccountsChanged)
       provider.on?.('chainChanged', onChainChanged)
     } catch {
@@ -244,9 +293,12 @@ export function getWalletClient(): WalletClient | null {
 let _publicClient: PublicClient | null = null
 export function getPublicClient(): PublicClient {
   if (!_publicClient) {
+    // Prefer an explicit RPC from env (Alchemy / QuickNode / etc.) — viem's
+    // default is the public Polygon RPC which rate-limits aggressively.
+    const envRpc = import.meta.env.VITE_POLYGON_RPC_URL as string | undefined
     _publicClient = createPublicClient({
       chain: polygon,
-      transport: http(),
+      transport: http(envRpc || undefined),
     })
   }
   return _publicClient

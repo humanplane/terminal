@@ -1,9 +1,19 @@
 import { ClobClient, OrderType, Side } from '@polymarket/clob-client'
-import { erc20Abi, type Address, type WalletClient } from 'viem'
 import {
+  encodeFunctionData,
+  erc20Abi,
+  maxUint256,
+  type Address,
+  type Hex,
+  type WalletClient,
+} from 'viem'
+import { polygon } from 'viem/chains'
+import {
+  CTF_ADDRESS,
   CTF_EXCHANGE,
   NEG_RISK_ADAPTER,
   NEG_RISK_CTF_EXCHANGE,
+  SIGNATURE_TYPE_EOA,
   SIGNATURE_TYPE_SAFE,
   USDC_ADDRESS,
   getPublicClient,
@@ -19,13 +29,27 @@ type Creds = { key: string; secret: string; passphrase: string }
 
 /** ---- Credential persistence ----------------------------------------- */
 
-function credsKey(safe: string) {
-  return `${LS_CREDS_PREFIX}${safe.toLowerCase()}`
+/**
+ * L2 credentials are scoped by (signer EOA, funder, signatureType) — the
+ * CLOB issues distinct keys for the same EOA signing under different funder
+ * or sigType combos. Keying only by EOA would cause cross-mode reuse that
+ * the server rejects.
+ */
+function credsKey(
+  eoa: string,
+  funder: string,
+  sigType: number
+): string {
+  return `${LS_CREDS_PREFIX}${eoa.toLowerCase()}:${funder.toLowerCase()}:${sigType}`
 }
 
-function loadCreds(safe: string): Creds | null {
+function loadCreds(
+  eoa: string,
+  funder: string,
+  sigType: number
+): Creds | null {
   try {
-    const raw = localStorage.getItem(credsKey(safe))
+    const raw = localStorage.getItem(credsKey(eoa, funder, sigType))
     if (!raw) return null
     const parsed = JSON.parse(raw)
     if (parsed?.key && parsed?.secret && parsed?.passphrase) return parsed
@@ -35,20 +59,54 @@ function loadCreds(safe: string): Creds | null {
   }
 }
 
-function saveCreds(safe: string, creds: Creds) {
+function saveCreds(
+  eoa: string,
+  funder: string,
+  sigType: number,
+  creds: Creds
+) {
   try {
-    localStorage.setItem(credsKey(safe), JSON.stringify(creds))
+    localStorage.setItem(
+      credsKey(eoa, funder, sigType),
+      JSON.stringify(creds)
+    )
   } catch {
     /* quota */
   }
 }
 
-export function clearCreds(safe: string) {
+/**
+ * Clear all L2 credentials for a given EOA across every mode/funder combo.
+ * Called on wallet disconnect or account-switch.
+ */
+export function clearCredsForEoa(eoa: string) {
   try {
-    localStorage.removeItem(credsKey(safe))
+    const prefix = `${LS_CREDS_PREFIX}${eoa.toLowerCase()}:`
+    const toRemove: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (k && k.startsWith(prefix)) toRemove.push(k)
+    }
+    for (const k of toRemove) localStorage.removeItem(k)
   } catch {
     /* noop */
   }
+}
+
+/**
+ * Legacy name kept so existing callers (wallet.ts) don't break. Argument is
+ * now the EOA (not the Safe) — see audit P0 #2.
+ */
+export const clearCreds = clearCredsForEoa
+
+/** Returns true if we have L2 credentials cached locally for the current
+ * wallet + trading mode. Safe to call from polling code. */
+export function hasCachedCreds(): boolean {
+  const eoa = wallet.eoa()
+  const funder = wallet.funder()
+  if (!eoa || !funder) return false
+  const sigType = wallet.mode() === 'eoa' ? SIGNATURE_TYPE_EOA : SIGNATURE_TYPE_SAFE
+  return loadCreds(eoa, funder, sigType) != null
 }
 
 /** ---- Ethers-compatible signer shim around viem ---------------------- */
@@ -112,58 +170,73 @@ export function invalidateClobClient() {
 
 export async function getClobClient(): Promise<ClobClient | null> {
   const eoa = wallet.eoa()
-  const safe = wallet.safe()
-  if (!eoa || !safe) return null
+  const funder = wallet.funder()
+  if (!eoa || !funder) return null
   const wc = getWalletClient()
   if (!wc) return null
 
-  let creds = loadCreds(safe)
+  const mode = wallet.mode()
+  const sigType = mode === 'eoa' ? SIGNATURE_TYPE_EOA : SIGNATURE_TYPE_SAFE
+
+  // L2 creds are scoped by (eoa, funder, sigType).
+  let creds = loadCreds(eoa, funder, sigType)
 
   // NOTE: per the clob-client SDK source (order-builder/helpers.js):
   //   maker = funderAddress ?? eoaSignerAddress
-  // So the signer shim correctly returns the EOA; the Safe is placed in the
-  // funder slot by us and becomes the order maker for signatureType=2.
+  // The signer returns the EOA. The funder determines who holds USDC and
+  // becomes the order maker:
+  //   EOA mode  → funder = EOA  → maker = EOA
+  //   Safe mode → funder = Safe → maker = Safe
   const signer = makeEthersSigner(wc, eoa, eoa) as any
 
   if (!creds) {
-    // Dedupe concurrent derivations (e.g. two queries racing at mount).
-    if (!_derivingCreds.has(safe)) {
-      const bootstrap = new ClobClient(
-        CLOB_HOST,
-        137,
-        signer,
-        undefined,
-        SIGNATURE_TYPE_SAFE,
-        safe,
-        undefined, // geoBlockToken
-        true // useServerTime — avoid 401s for users with skewed clocks
-      )
-      // Try deriving nonce-0 key first (idempotent, no server-side key
-      // creation). Fall back to create() only if no existing key exists.
-      const p = bootstrap
-        .deriveApiKey(0)
-        .catch(() => bootstrap.createApiKey(0))
-        .then((fresh) => {
-          if (!fresh?.key) throw new Error('failed to derive API credentials')
-          const c: Creds = {
-            key: fresh.key,
-            secret: fresh.secret,
-            passphrase: fresh.passphrase,
-          }
-          saveCreds(safe, c)
-          _derivingCreds.delete(safe)
-          return c
-        })
-        .catch((err) => {
-          _derivingCreds.delete(safe)
-          throw err
-        })
-      _derivingCreds.set(safe, p)
+    // Dedupe concurrent derivations AND re-check the localStorage cache
+    // just before claiming the slot — if another tab/caller finished
+    // between our first read and now, we can skip the prompt.
+    const slotKey = `${eoa.toLowerCase()}:${funder.toLowerCase()}:${sigType}`
+    if (!_derivingCreds.has(slotKey)) {
+      const refreshed = loadCreds(eoa, funder, sigType)
+      if (refreshed) {
+        creds = refreshed
+      } else {
+        const bootstrap = new ClobClient(
+          CLOB_HOST,
+          137,
+          signer,
+          undefined,
+          sigType,
+          funder,
+          undefined, // geoBlockToken
+          true
+        )
+        const p = bootstrap
+          .createOrDeriveApiKey(0)
+          .then((fresh) => {
+            if (!fresh?.key) {
+              throw new Error(
+                'Polymarket returned empty credentials — check your wallet and try again'
+              )
+            }
+            const c: Creds = {
+              key: fresh.key,
+              secret: fresh.secret,
+              passphrase: fresh.passphrase,
+            }
+            saveCreds(eoa, funder, sigType, c)
+            return c
+          })
+          .finally(() => {
+            _derivingCreds.delete(slotKey)
+          })
+        _derivingCreds.set(slotKey, p)
+        creds = await p
+      }
+    } else {
+      creds = await _derivingCreds.get(slotKey)!
     }
-    creds = await _derivingCreds.get(safe)!
   }
 
-  const cacheKey = `${safe.toLowerCase()}:${creds.key}`
+  const cacheKey = `${mode}:${funder.toLowerCase()}:${creds.key}`
   const cached = _clientCache.get(cacheKey)
   if (cached) return cached
 
@@ -172,10 +245,10 @@ export async function getClobClient(): Promise<ClobClient | null> {
     137,
     signer,
     creds,
-    SIGNATURE_TYPE_SAFE,
-    safe,
+    sigType,
+    funder,
     undefined, // geoBlockToken
-    true // useServerTime
+    true
   )
   _clientCache.set(cacheKey, client)
   return client
@@ -190,32 +263,37 @@ export type AllowanceStatus = {
   negRiskAdapter: bigint
 }
 
-export async function fetchUsdcStatus(safe: Address): Promise<AllowanceStatus> {
+/**
+ * Read USDC balance + allowances for a holder (EOA or Safe — this function
+ * doesn't care). Caller passes the address holding the funds for the current
+ * trading mode.
+ */
+export async function fetchUsdcStatus(holder: Address): Promise<AllowanceStatus> {
   const pc = getPublicClient()
   const [balance, a1, a2, a3] = await Promise.all([
     pc.readContract({
       address: USDC_ADDRESS,
       abi: erc20Abi,
       functionName: 'balanceOf',
-      args: [safe],
+      args: [holder],
     }) as Promise<bigint>,
     pc.readContract({
       address: USDC_ADDRESS,
       abi: erc20Abi,
       functionName: 'allowance',
-      args: [safe, CTF_EXCHANGE],
+      args: [holder, CTF_EXCHANGE],
     }) as Promise<bigint>,
     pc.readContract({
       address: USDC_ADDRESS,
       abi: erc20Abi,
       functionName: 'allowance',
-      args: [safe, NEG_RISK_CTF_EXCHANGE],
+      args: [holder, NEG_RISK_CTF_EXCHANGE],
     }) as Promise<bigint>,
     pc.readContract({
       address: USDC_ADDRESS,
       abi: erc20Abi,
       functionName: 'allowance',
-      args: [safe, NEG_RISK_ADAPTER],
+      args: [holder, NEG_RISK_ADAPTER],
     }) as Promise<bigint>,
   ])
   return {
@@ -225,6 +303,98 @@ export async function fetchUsdcStatus(safe: Address): Promise<AllowanceStatus> {
     negRiskAdapter: a3,
   }
 }
+
+/**
+ * EOA-mode approvals: sign `USDC.approve(spender, max)` directly from the
+ * EOA. One tx per spender — batching would need a multicall contract which
+ * isn't worth the complexity for a few approvals. User pays gas.
+ */
+export async function approveUsdcFromEOA(
+  spender: Address,
+  amount: bigint = maxUint256
+): Promise<Hex> {
+  const wc = getWalletClient()
+  const eoa = wallet.eoa()
+  if (!wc || !eoa) throw new Error('wallet not connected')
+  const data = encodeFunctionData({
+    abi: erc20Abi,
+    functionName: 'approve',
+    args: [spender, amount],
+  })
+  return wc.sendTransaction({
+    account: eoa,
+    chain: polygon,
+    to: USDC_ADDRESS,
+    data,
+  })
+}
+
+const ctfErc1155Abi = [
+  {
+    type: 'function',
+    name: 'setApprovalForAll',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'operator', type: 'address' },
+      { name: 'approved', type: 'bool' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'isApprovedForAll',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'account', type: 'address' },
+      { name: 'operator', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+] as const
+
+/**
+ * EOA-mode CTF ERC-1155 approval. Required for SELL orders (the exchange
+ * transfers conditional tokens out of your account). Without this, sells
+ * revert with "ERC1155: caller is not token owner or approved".
+ */
+export async function setCtfApprovalForAllFromEOA(
+  operator: Address,
+  approved = true
+): Promise<Hex> {
+  const wc = getWalletClient()
+  const eoa = wallet.eoa()
+  if (!wc || !eoa) throw new Error('wallet not connected')
+  const data = encodeFunctionData({
+    abi: ctfErc1155Abi,
+    functionName: 'setApprovalForAll',
+    args: [operator, approved],
+  })
+  return wc.sendTransaction({
+    account: eoa,
+    chain: polygon,
+    to: CTF_ADDRESS,
+    data,
+  })
+}
+
+/** Read CTF ERC-1155 operator approval for a given holder. */
+export async function isCtfApprovedForAll(
+  holder: Address,
+  operator: Address
+): Promise<boolean> {
+  return (await getPublicClient().readContract({
+    address: CTF_ADDRESS,
+    abi: ctfErc1155Abi,
+    functionName: 'isApprovedForAll',
+    args: [holder, operator],
+  })) as boolean
+}
+
+export const USDC_SPENDERS = {
+  ctfExchange: CTF_EXCHANGE,
+  negRiskExchange: NEG_RISK_CTF_EXCHANGE,
+  negRiskAdapter: NEG_RISK_ADAPTER,
+} as const
 
 /**
  * Approve USDC for Polymarket exchange contracts.
@@ -369,7 +539,13 @@ export async function placeOrder(args: PlaceOrderArgs) {
   return response
 }
 
+/**
+ * List open orders — only if credentials are already cached. We never derive
+ * creds from this code path because `openOrdersQuery` polls on an interval
+ * and we don't want background polls triggering signature prompts.
+ */
 export async function listOpenOrders(params: { market?: string } = {}) {
+  if (!hasCachedCreds()) return []
   const client = await getClobClient()
   if (!client) return []
   return client.getOpenOrders(params.market ? { market: params.market } : {})

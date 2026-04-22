@@ -166,7 +166,13 @@ export type UserActivity = {
   transactionHash?: string
 }
 
-const base = '/api'
+// In dev the Vite proxy routes `/api` → localhost:8080. In production the
+// frontend may be served from a different origin than the backend, so allow
+// an override via `VITE_API_BASE` (e.g. `https://api.example.com`). The
+// string must not include a trailing slash.
+const base =
+  ((import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, '') ??
+    '') + '/api'
 
 async function json<T>(path: string, signal?: AbortSignal): Promise<T> {
   const r = await fetch(`${base}${path}`, { signal })

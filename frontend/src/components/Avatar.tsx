@@ -27,9 +27,12 @@ type Props = {
  * `seed`: either 2-char initials or a 5×5 terminal-styled identicon.
  */
 export function Avatar(props: Props) {
-  const [failed, setFailed] = createSignal(false)
+  // Track the specific src that failed — so when a virtualized row gets
+  // reused with a new (valid) image, we don't hide it based on a stale
+  // failure for a different URL.
+  const [failedSrc, setFailedSrc] = createSignal<string | null>(null)
   const size = () => SIZES[props.size ?? 'md']
-  const showImage = () => !!props.src && !failed()
+  const showImage = () => !!props.src && failedSrc() !== props.src
 
   const initials = () => {
     const s = (props.seed ?? '').trim()
@@ -69,7 +72,7 @@ export function Avatar(props: Props) {
         alt={props.alt ?? ''}
         loading="lazy"
         decoding="async"
-        onError={() => setFailed(true)}
+        onError={() => setFailedSrc(props.src ?? null)}
         class={`${size().box} ${rounded()} shrink-0 border border-border-2 bg-panel-2 object-cover`}
       />
     </Show>

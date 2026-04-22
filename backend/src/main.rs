@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tower_http=debug".into()),
+                .unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -86,7 +86,15 @@ async fn main() -> anyhow::Result<()> {
         .layer(TimeoutLayer::new(Duration::from_secs(20)))
         .layer(TraceLayer::new_for_http());
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8080));
+    let host: std::net::IpAddr = std::env::var("HOST")
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid HOST: {e}"))?;
+    let port: u16 = std::env::var("PORT")
+        .unwrap_or_else(|_| "8080".to_string())
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid PORT: {e}"))?;
+    let addr = std::net::SocketAddr::new(host, port);
     tracing::info!("listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -291,6 +299,12 @@ async fn stream_book(
                     "ws giving up after {} attempts",
                     attempts
                 );
+                // Tell the client we're done on purpose so native
+                // EventSource stops auto-reconnecting. The browser treats
+                // this as a normal message type it can branch on.
+                let _ = tx
+                    .send(Event::default().event("done").data("max_attempts"))
+                    .await;
                 return;
             }
 
@@ -550,11 +564,22 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
+        // Log the full chain internally; don't leak it to clients.
         tracing::error!("request error: {:#}", self.0);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": self.0.to_string() })),
-        )
-            .into_response()
+        let msg = self.0.to_string();
+        // Distinguish validation errors (safe to echo) from upstream/internal
+        // errors (generic message only).
+        let is_validation = msg.starts_with("invalid ") || msg.contains("too long");
+        let status = if is_validation {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        let body = if is_validation {
+            serde_json::json!({ "error": msg })
+        } else {
+            serde_json::json!({ "error": "internal error" })
+        };
+        (status, Json(body)).into_response()
     }
 }

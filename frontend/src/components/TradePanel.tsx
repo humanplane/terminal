@@ -3,14 +3,25 @@ import { createMutation, createQuery, useQueryClient } from '@tanstack/solid-que
 import { formatEther, formatUnits } from 'viem'
 import type { Market } from '../lib/api'
 import {
+  approveUsdcFromEOA,
   cancelOrder,
   fetchUsdcStatus,
+  hasCachedCreds,
+  isCtfApprovedForAll,
   isSafeDeployed,
   listOpenOrders,
   placeOrder,
+  setCtfApprovalForAllFromEOA,
+  USDC_SPENDERS,
   type PlaceOrderArgs,
 } from '../lib/polymarket'
-import { connect, getWalletClient, wallet } from '../lib/wallet'
+
+import {
+  connect,
+  getWalletClient,
+  setTradingMode,
+  wallet,
+} from '../lib/wallet'
 import {
   MIN_MATIC_WEI,
   deploySafe,
@@ -51,6 +62,7 @@ export function TradePanel(props: Props) {
 
 function ConnectedTradePanel(props: Props) {
   const qc = useQueryClient()
+  const funder = () => wallet.funder()!
   const safe = () => wallet.safe()!
 
   const [side, setSide] = createSignal<'BUY' | 'SELL'>('BUY')
@@ -67,21 +79,21 @@ function ConnectedTradePanel(props: Props) {
   const outcomeLabel = () =>
     props.market.outcomes[outcomeIdx()] ?? (outcomeIdx() === 0 ? 'YES' : 'NO')
 
-  // USDC status (only if on Polygon)
+  // USDC status — reads from whichever address holds funds in the current
+  // trading mode (EOA in 'eoa' mode, Safe in 'safe' mode).
   const usdcQuery = createQuery(() => ({
-    queryKey: ['usdc-status', safe()],
-    queryFn: () => fetchUsdcStatus(safe()),
-    enabled: wallet.onPolygon() && !!safe(),
+    queryKey: ['usdc-status', wallet.mode(), funder()],
+    queryFn: () => fetchUsdcStatus(funder()),
+    enabled: wallet.onPolygon() && !!funder(),
     staleTime: 15_000,
     refetchInterval: 30_000,
   }))
 
-  // Safe deployment — if the user has a fresh wallet that's never touched
-  // Polymarket, their Safe proxy isn't deployed yet and trades will fail.
+  // Safe deployment — only relevant in Safe mode.
   const safeDeployedQuery = createQuery(() => ({
     queryKey: ['safe-deployed', safe()],
     queryFn: () => isSafeDeployed(safe()),
-    enabled: wallet.onPolygon() && !!safe(),
+    enabled: wallet.onPolygon() && !!safe() && wallet.mode() === 'safe',
     staleTime: 5 * 60_000,
   }))
 
@@ -95,10 +107,31 @@ function ConnectedTradePanel(props: Props) {
     refetchInterval: 60_000,
   }))
 
+  // CTF ERC-1155 operator approvals — required for SELL orders. Each
+  // exchange needs its own `setApprovalForAll` (neg-risk + adapter only
+  // relevant for neg-risk markets).
+  const ctfApprovalsQuery = createQuery(() => ({
+    queryKey: ['ctf-approvals', wallet.mode(), funder()],
+    queryFn: async () => {
+      const f = funder()
+      const [ctfEx, negEx, negAdap] = await Promise.all([
+        isCtfApprovedForAll(f, USDC_SPENDERS.ctfExchange),
+        isCtfApprovedForAll(f, USDC_SPENDERS.negRiskExchange),
+        isCtfApprovedForAll(f, USDC_SPENDERS.negRiskAdapter),
+      ])
+      return { ctfExchange: ctfEx, negRiskExchange: negEx, negRiskAdapter: negAdap }
+    },
+    enabled: wallet.onPolygon() && !!funder(),
+    staleTime: 60_000,
+    refetchInterval: 120_000,
+  }))
+
+  // Only poll for open orders once creds are cached — otherwise each poll
+  // would trigger a fresh L1 signature prompt.
   const openOrdersQuery = createQuery(() => ({
-    queryKey: ['open-orders', safe(), props.market.conditionId],
+    queryKey: ['open-orders', wallet.mode(), funder(), props.market.conditionId],
     queryFn: () => listOpenOrders({ market: props.market.conditionId }),
-    enabled: !!safe(),
+    enabled: !!funder() && hasCachedCreds(),
     staleTime: 5_000,
     refetchInterval: 10_000,
   }))
@@ -122,9 +155,12 @@ function ConnectedTradePanel(props: Props) {
     },
   }))
 
-  // Init flow: deploy Safe (if needed) then apply all approvals.
+  // --- Init flow --------------------------------------------------------
+  // Safe mode: deploy Safe (if needed) + MultiSend 7 approvals.
+  // EOA mode: one USDC.approve tx per exchange spender (1-3 txs, much simpler).
+
   const [initStep, setInitStep] = createSignal<
-    null | 'deploying' | 'approving'
+    null | 'deploying' | 'approving' | string
   >(null)
 
   const initMut = createMutation(() => ({
@@ -132,39 +168,98 @@ function ConnectedTradePanel(props: Props) {
       const wc = getWalletClient()
       if (!wc) throw new Error('wallet not available')
       const eoa = wallet.eoa()!
-      const s = safe()
-
-      // 1. Deploy Safe if missing.
-      if (!safeDeployedQuery.data) {
-        setInitStep('deploying')
-        const deployHash = await deploySafe(wc, eoa)
-        await waitForTx(deployHash)
-        await qc.invalidateQueries({ queryKey: ['safe-deployed'] })
+      // Snapshot the mode at the start of the mutation. If the user flips
+      // the EOA ↔ Safe toggle mid-flight, we abort rather than submitting
+      // against the wrong funder.
+      const modeAtStart = wallet.mode()
+      const assertMode = () => {
+        if (wallet.mode() !== modeAtStart) {
+          throw new Error('Trading mode changed — please retry')
+        }
       }
 
-      // 2. Apply approvals.
-      setInitStep('approving')
-      const approveHash = await setupApprovals(wc, eoa, s)
-      await waitForTx(approveHash)
+      if (modeAtStart === 'safe') {
+        const s = safe()
+        if (!safeDeployedQuery.data) {
+          setInitStep('deploying')
+          const deployHash = await deploySafe(wc, eoa)
+          await waitForTx(deployHash)
+          assertMode()
+          await qc.invalidateQueries({ queryKey: ['safe-deployed'] })
+        }
+        setInitStep('approving')
+        const approveHash = await setupApprovals(wc, eoa, s)
+        await waitForTx(approveHash)
+        return
+      }
+
+      // EOA mode — two-phase approvals:
+      //   Phase 1: USDC.approve for each exchange spender (so BUY works)
+      //   Phase 2: CTF.setApprovalForAll for each exchange (so SELL works)
+      const u = usdcQuery.data
+      const ctfA = ctfApprovalsQuery.data
+      const usdcTargets: Array<{ name: string; spender: `0x${string}` }> = []
+      if (!u || u.ctfExchange === 0n)
+        usdcTargets.push({ name: 'CTF exchange', spender: USDC_SPENDERS.ctfExchange })
+      if (!u || u.negRiskExchange === 0n)
+        usdcTargets.push({ name: 'neg-risk exchange', spender: USDC_SPENDERS.negRiskExchange })
+      if (!u || u.negRiskAdapter === 0n)
+        usdcTargets.push({ name: 'neg-risk adapter', spender: USDC_SPENDERS.negRiskAdapter })
+
+      const ctfTargets: Array<{ name: string; operator: `0x${string}` }> = []
+      if (!ctfA || !ctfA.ctfExchange)
+        ctfTargets.push({ name: 'CTF exchange (shares)', operator: USDC_SPENDERS.ctfExchange })
+      if (!ctfA || !ctfA.negRiskExchange)
+        ctfTargets.push({ name: 'neg-risk exchange (shares)', operator: USDC_SPENDERS.negRiskExchange })
+      if (!ctfA || !ctfA.negRiskAdapter)
+        ctfTargets.push({ name: 'neg-risk adapter (shares)', operator: USDC_SPENDERS.negRiskAdapter })
+
+      const totalSteps = usdcTargets.length + ctfTargets.length
+      let stepNum = 0
+
+      for (const t of usdcTargets) {
+        stepNum++
+        assertMode()
+        setInitStep(`approving USDC ${stepNum}/${totalSteps}`)
+        const hash = await approveUsdcFromEOA(t.spender)
+        await waitForTx(hash)
+      }
+      for (const t of ctfTargets) {
+        stepNum++
+        assertMode()
+        setInitStep(`approving shares ${stepNum}/${totalSteps}`)
+        const hash = await setCtfApprovalForAllFromEOA(t.operator)
+        await waitForTx(hash)
+      }
     },
     onSettled: () => {
       setInitStep(null)
       qc.invalidateQueries({ queryKey: ['safe-deployed'] })
       qc.invalidateQueries({ queryKey: ['usdc-status'] })
       qc.invalidateQueries({ queryKey: ['matic-balance'] })
+      qc.invalidateQueries({ queryKey: ['ctf-approvals'] })
     },
   }))
 
   const needsInit = () => {
-    if (safeDeployedQuery.data === false) return true
-    // If deployed but allowance is zero, we still need the approval batch.
+    if (wallet.mode() === 'safe') {
+      if (safeDeployedQuery.data === false) return true
+    }
     const u = usdcQuery.data
-    if (!u) return false
-    return (
-      u.ctfExchange === 0n &&
-      u.negRiskExchange === 0n &&
+    const ctfA = ctfApprovalsQuery.data
+    if (!u || !ctfA) return false
+    // Show the init banner if ANY relevant approval is missing, so users
+    // with a partial setup can still complete the remaining steps (OR-gate,
+    // not AND). "Relevant" depends on market type, but we're conservative
+    // and require the full set in EOA mode — that way the Trade tab works
+    // for both binary and neg-risk markets without re-approving.
+    const anyUsdcMissing =
+      u.ctfExchange === 0n ||
+      u.negRiskExchange === 0n ||
       u.negRiskAdapter === 0n
-    )
+    const anyCtfMissing =
+      !ctfA.ctfExchange || !ctfA.negRiskExchange || !ctfA.negRiskAdapter
+    return anyUsdcMissing || anyCtfMissing
   }
 
   const hasEnoughMatic = () => {
@@ -271,16 +366,43 @@ function ConnectedTradePanel(props: Props) {
 
   return (
     <div class="flex h-full flex-col overflow-y-auto">
-      {/* One-shot initialize flow — deploy Safe + apply all approvals from
-          the user's EOA. One-time cost ~0.2 MATIC; no relayer needed. */}
+      {/* Trading mode toggle — which address funds trades. */}
+      <div class="flex h-8 shrink-0 items-center justify-between border-b border-border-2 px-4 eyebrow">
+        <span>funds on</span>
+        <div class="segmented">
+          <button
+            data-active={wallet.mode() === 'eoa'}
+            onClick={() => setTradingMode('eoa')}
+            title="Trade from your EOA directly"
+          >
+            EOA
+          </button>
+          <button
+            data-active={wallet.mode() === 'safe'}
+            onClick={() => setTradingMode('safe')}
+            title="Trade from your Polymarket Safe (polymarket.com default)"
+          >
+            Safe
+          </button>
+        </div>
+      </div>
+
+      {/* Initialize flow — branches by mode. */}
       <Show when={needsInit()}>
         <div class="border-b border-border-3 bg-panel-2 p-3">
           <div class="eyebrow text-text-bright">initialize trading</div>
           <p class="mt-1.5 text-[11px] leading-snug text-text">
-            {safeDeployedQuery.data === false
-              ? 'Deploy your Polymarket Safe, then approve USDC + CTF spending.'
-              : 'Approve USDC + CTF spending to unlock trading.'}
-            {' '}One-time setup, costs ~0.2 MATIC in gas.
+            <Show
+              when={wallet.mode() === 'eoa'}
+              fallback={
+                safeDeployedQuery.data === false
+                  ? 'Deploy your Polymarket Safe, then approve USDC + CTF spending. One-time setup, ~0.2 MATIC.'
+                  : 'Approve USDC + CTF spending via your Safe. One-time, ~0.15 MATIC.'
+              }
+            >
+              Approve USDC spending directly from your EOA. Up to 3 quick
+              approvals (1 per exchange). ~0.01 MATIC each.
+            </Show>
           </p>
           <Show
             when={hasEnoughMatic()}
@@ -292,9 +414,8 @@ function ConnectedTradePanel(props: Props) {
                     ? Number(formatEther(maticQuery.data)).toFixed(4)
                     : '—'}
                 </span>{' '}
-                MATIC on your EOA ({wallet.eoa()?.slice(0, 6)}…). Send at
-                least 0.3 MATIC to this address to continue. Polygon gas is
-                cheap but this wallet currently has too little.
+                MATIC on your EOA ({wallet.eoa()?.slice(0, 6)}…). Send ~0.3
+                MATIC to this address to continue.
               </div>
             }
           >
@@ -303,13 +424,13 @@ function ConnectedTradePanel(props: Props) {
               disabled={initMut.isPending}
               class="mt-2 h-8 w-full cursor-pointer border border-text-bright bg-text-bright text-[11px] font-semibold uppercase tracking-[0.14em] text-bg hover:bg-text hover:border-text disabled:opacity-60"
             >
-              {initStep() === 'deploying'
-                ? 'deploying safe… (1/2)'
-                : initStep() === 'approving'
-                  ? 'approving… (2/2)'
+              {initStep() ?? (
+                wallet.mode() === 'eoa'
+                  ? 'approve USDC'
                   : safeDeployedQuery.data === false
                     ? 'initialize (2 txs)'
-                    : 'approve (1 tx)'}
+                    : 'approve (1 tx)'
+              )}
             </button>
           </Show>
           <Show when={initMut.error}>
