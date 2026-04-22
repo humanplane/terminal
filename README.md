@@ -80,8 +80,9 @@ never touches wallet material.
 
 ### Wallet / trading (optional)
 - **Connect MetaMask** — derive your Polymarket Safe via CREATE2 on connect
-- **"View my positions"** — drops you into the Trader view pre-filtered to
-  your Safe (live PnL, positions, trades)
+- **"View my positions"** — wallet dropdown shows both your EOA and Safe
+  addresses; click either to land on its Trader view (live PnL, positions,
+  trades) and auto-switch the Trade tab to the matching mode
 - **Two trading modes, user-selectable:**
   - **EOA mode** (default when USDC is on your EOA): signer == funder == EOA.
     Direct approvals via `USDC.approve` + `CTF.setApprovalForAll`. Up to
@@ -90,8 +91,15 @@ never touches wallet material.
     funder == your Polymarket Safe. Approvals go through the Safe via a
     single MultiSend `execTransaction` using a pre-validated signature.
     If the Safe isn't deployed, we deploy it first (2 txs total, ~0.2 MATIC).
-- **Order form**: outcome toggle, BUY/SELL, price (auto-snapped to tick
-  size), size, post-only. Live USDC allowance shown.
+- **Order form** — Market or Limit:
+  - **Market**: walks the live order book client-side to compute average
+    fill price, worst price, and fillable size before submit. Submitted
+    as FAK (fill-and-kill) with 2% slippage cap.
+  - **Limit**: price auto-prefilled with the best opposite side (best ask
+    on Buy, best bid on Sell), tick-size snapped, optional post-only.
+  - USDC amount presets ($5/$10/$50/$100) for market Buy; share presets
+    (10/50/100/500) otherwise.
+  - Submit button labels live: `BUY 250 YES @ ~47.4¢` or `BUY 100 YES @ 47¢ · $47.00`.
 - **Open orders** list + cancel, polled every 10 seconds
 - **Error translation** — CLOB rejection codes remapped to friendly copy
   ("Size below this market's minimum", "Price isn't a multiple of this
@@ -317,8 +325,6 @@ post-only, or set your price within the spread.
 
 ## Known limitations
 
-- **Market orders (FOK/FAK)** — SDK wiring is in place but the order form
-  UI only emits GTC limits right now.
 - **Position redemption** — not implemented. For resolved markets, use
   polymarket.com to claim winnings.
 - **Compare traders side-by-side** — not implemented.
