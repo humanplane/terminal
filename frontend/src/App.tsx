@@ -314,8 +314,14 @@ export default function Shell(props: { children?: JSX.Element }) {
     <div class="flex h-screen flex-col bg-bg">
       <header class="flex h-10 shrink-0 items-center justify-between border-b border-border-2 px-4">
         <div class="flex items-center gap-5">
-          <div class="flex items-center gap-2">
-            <span class="inline-block h-2 w-2 bg-text-bright" />
+          <div class="flex items-center gap-2.5">
+            <img
+              src="/humanplane-logo-white.webp"
+              alt="humanplane"
+              width="22"
+              height="22"
+              class="block h-[18px] w-[22px] object-contain"
+            />
             <span class="text-[11px] font-semibold uppercase tracking-[0.25em] text-text-bright">
               humanplane
             </span>
