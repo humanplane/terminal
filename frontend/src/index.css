@@ -1,0 +1,175 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans:
+    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --font-mono:
+    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --color-bg: #000000;
+  --color-panel: #0a0a0a;
+  --color-panel-2: #111111;
+  --color-hover: #181818;
+
+  --color-border: #1c1c1c;
+  --color-border-2: #262626;
+  --color-border-3: #3a3a3a;
+
+  --color-text: #c9c9c9;
+  --color-text-bright: #ffffff;
+  --color-text-dim: #6e6e6e;
+  --color-text-dimmer: #3e3e3e;
+
+  --color-up: #00c972;
+  --color-down: #ff3355;
+  --color-accent: #ffffff;
+
+  --radius-card: 0px;
+
+  /* Single uppercase tracking used across all eyebrows/labels */
+  --tracking-caps: 0.14em;
+}
+
+html,
+body,
+#root {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-feature-settings: "tnum", "zero";
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  height: 100%;
+  margin: 0;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/jetbrains-mono:vf@latest/latin-wght-normal.woff2")
+    format("woff2-variations");
+}
+
+*,
+*::before,
+*::after {
+  border-radius: 0 !important;
+}
+
+button,
+select,
+input {
+  font-family: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-2);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-3);
+}
+
+/* --- design-system utility classes ---------------------------------- */
+
+/* Eyebrow: tiny uppercase label, consistent everywhere */
+.eyebrow {
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--color-text-dim);
+}
+.eyebrow-bright {
+  color: var(--color-text-bright);
+}
+
+/* Section header: h-8 strip with eyebrow inside */
+.section-head {
+  display: flex;
+  height: 32px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--color-border);
+  padding: 0 16px;
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--color-text-dim);
+}
+.section-head-dense {
+  padding: 0 12px;
+}
+
+/* Live pulse used in multiple places */
+@keyframes glow-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.live-dot {
+  animation: glow-pulse 1.4s ease-in-out infinite;
+}
+
+.tv-lightweight-charts {
+  background: transparent !important;
+}
+
+/* Skeleton loader — subtle shimmer, terminal-appropriate */
+@keyframes skeleton-pulse {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.skeleton {
+  background: var(--color-panel-2);
+  animation: skeleton-pulse 1.6s ease-in-out infinite;
+}
+
+/* Segmented control: zero-gap buttons with shared inset border feel */
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--color-border-2);
+}
+.segmented > button {
+  height: 20px;
+  padding: 0 8px;
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--color-text-dim);
+  background: transparent;
+  cursor: pointer;
+  border: 0;
+  border-right: 1px solid var(--color-border-2);
+}
+.segmented > button:last-child {
+  border-right: 0;
+}
+.segmented > button:hover {
+  color: var(--color-text-bright);
+}
+.segmented > button[data-active="true"] {
+  background: var(--color-text-bright);
+  color: var(--color-bg);
+}

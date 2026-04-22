@@ -1,0 +1,22 @@
+[package]
+name = "polymarket-terminal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+anyhow = "1"
+polyoxide-core = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+polyoxide-gamma = "0.13"
+polyoxide-data = "0.13"
+polyoxide-clob = { version = "0.13", features = ["ws"], default-features = false }
