@@ -6,11 +6,14 @@ import { createLiveBook, type SortedLevel } from '../lib/stream'
 import { favorites } from '../lib/favorites'
 import { fmtPct, fmtUSDFull, fmtDate, relativeTime } from '../lib/format'
 import { OrderBook } from './OrderBook'
-import { PriceChart } from './PriceChart'
+import { PriceChart, type PriceLineSpec } from './PriceChart'
 import { Avatar } from './Avatar'
 import { TradesFeed } from './TradesFeed'
 import { TopHolders } from './TopHolders'
 import { TradePanel } from './TradePanel'
+import { MarketAlertButton } from './MarketAlertButton'
+import { RedemptionBanner } from './RedemptionBanner'
+import { wallet } from '../lib/wallet'
 
 type Props = {
   market: Market
@@ -25,10 +28,26 @@ const RIGHT_TABS: { k: RightTab; l: string }[] = [
   { k: 'trade', l: 'Trade' },
 ]
 
+export type TradePrefill = {
+  price: number
+  side: 'BUY' | 'SELL'
+  outcomeIdx: number
+}
+
 export function MarketDetail(props: Props) {
   const [descOpen, setDescOpen] = createSignal(false)
   const [interval, setInterval] = createSignal<IntervalKey>('1w')
   const [rightTab, setRightTab] = createSignal<RightTab>('book')
+  // One-shot signal: OrderBook click → TradePanel reads and clears it.
+  const [tradePrefill, setTradePrefill] = createSignal<TradePrefill | null>(null)
+
+  // Click on an order-book level: pre-fill the limit form and switch tabs.
+  // Convention: ask click = BUY-take; bid click = SELL-take. Book is YES-only,
+  // so outcomeIdx is always 0.
+  const onClickLevel = (price: number, side: 'BUY' | 'SELL') => {
+    setTradePrefill({ price, side, outcomeIdx: 0 })
+    setRightTab('trade')
+  }
 
   const yesToken = () => props.market.clobTokenIds[0]
 
@@ -42,6 +61,44 @@ export function MarketDetail(props: Props) {
   }))
 
   const live = createLiveBook(yesToken)
+
+  // Connected user's positions in this market. Drives the avg-entry line on
+  // the price chart. Disabled when wallet not connected.
+  const positionsQuery = createQuery(() => ({
+    queryKey: ['user-positions', wallet.funder()],
+    queryFn: ({ signal }) =>
+      api.userPositions(wallet.funder()!, { limit: 500 }, signal),
+    enabled: wallet.isConnected() && !!wallet.funder(),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: false,
+  }))
+
+  // Filtered to positions on this market — reused by the chart line memo
+  // below and by the RedemptionBanner.
+  const positionsHere = createMemo(() =>
+    (positionsQuery.data ?? []).filter(
+      (p) => p.conditionId === props.market.conditionId && p.size > 0
+    )
+  )
+
+  // Build reference lines for positions on this market. NO positions are
+  // mapped to YES-space (1 - avgPrice) so the line is meaningful on the
+  // YES-only chart; the label names the actual outcome.
+  const avgPriceLines = createMemo<PriceLineSpec[]>(() => {
+    if (!wallet.isConnected()) return []
+    return positionsHere().map((p) => {
+      const outcome =
+        props.market.outcomes[p.outcomeIndex] ??
+        (p.outcomeIndex === 0 ? 'YES' : 'NO')
+      const yesSpace = p.outcomeIndex === 0 ? p.avgPrice : 1 - p.avgPrice
+      return {
+        price: yesSpace,
+        color: '#d4af37',
+        title: `avg ${outcome} ${(p.avgPrice * 100).toFixed(1)}¢`,
+      }
+    })
+  })
 
   const snapshotBookQuery = createQuery(() => ({
     queryKey: ['book', yesToken()],
@@ -156,6 +213,10 @@ export function MarketDetail(props: Props) {
               <span>LIVE</span>
             </span>
           </Show>
+          <MarketAlertButton
+            market={props.market}
+            currentYes={liveYesPrice()}
+          />
           <button
             onClick={() => favorites.toggleMarket(props.market.id)}
             class={
@@ -208,6 +269,12 @@ export function MarketDetail(props: Props) {
           </Show>
         </div>
       </div>
+
+      {/* Resolution redemption banner — only when the market is closed and
+          the connected wallet still has CTF balances to claim. */}
+      <Show when={props.market.closed && positionsHere().length > 0}>
+        <RedemptionBanner market={props.market} positions={positionsHere()} />
+      </Show>
 
       {/* Stat strip — best bid/ask and spread follow the live book. */}
       <div class="grid shrink-0 grid-cols-5 border-b border-border-2">
@@ -277,7 +344,13 @@ export function MarketDetail(props: Props) {
                 </div>
               }
             >
-              {(history) => <PriceChart data={history} liveTick={liveTick()} />}
+              {(history) => (
+                <PriceChart
+                  data={history}
+                  liveTick={liveTick()}
+                  priceLines={avgPriceLines()}
+                />
+              )}
             </Show>
           </div>
         </div>
@@ -305,7 +378,12 @@ export function MarketDetail(props: Props) {
           </div>
           <div class="min-h-0 flex-1 overflow-hidden">
             <Show when={rightTab() === 'book'}>
-              <OrderBook bids={bidsView()} asks={asksView()} levels={14} />
+              <OrderBook
+                bids={bidsView()}
+                asks={asksView()}
+                levels={14}
+                onClickLevel={onClickLevel}
+              />
             </Show>
             <Show when={rightTab() === 'tape'}>
               <TradesFeed conditionId={props.market.conditionId} />
@@ -318,6 +396,8 @@ export function MarketDetail(props: Props) {
                 market={props.market}
                 bids={bidsView}
                 asks={asksView}
+                prefill={tradePrefill}
+                onPrefillConsumed={() => setTradePrefill(null)}
               />
             </Show>
           </div>
