@@ -506,12 +506,12 @@ export async function placeOrder(args: PlaceOrderArgs) {
 
   let response: any
   if (type === 'FOK' || type === 'FAK') {
-    // Market-order semantics: BUY → `amount` is USDC cost; SELL → shares.
-    const amount = side === Side.BUY ? args.price * args.size : args.size
+    // SDK's UserMarketOrder.amount: USDC for BUY, shares for SELL. Callers
+    // (TradePanel) already pass `args.size` in those units, so no conversion.
     const marketOrder = {
       tokenID: args.tokenId,
       price: args.price,
-      amount,
+      amount: args.size,
       side,
     }
     response = await client.createAndPostMarketOrder(
