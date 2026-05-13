@@ -7,6 +7,10 @@ type Props = {
   bids: SortedLevel[]
   asks: SortedLevel[]
   levels?: number
+  /** Click handler: receives the price and the side the click implies.
+   *  Convention: clicking an ask = taking it (BUY); clicking a bid = taking
+   *  it (SELL). Caller is responsible for wiring this to the trade form. */
+  onClickLevel?: (price: number, side: 'BUY' | 'SELL') => void
 }
 
 type DisplayLevel = { price: number; size: number; cum: number }
@@ -117,7 +121,18 @@ export function OrderBook(props: Props) {
       >
         <div class="flex flex-1 flex-col justify-end overflow-hidden">
           <Index each={asks()}>
-            {(lvl) => <Row lvl={lvl()} maxCum={maxCum()} side="ask" />}
+            {(lvl) => (
+              <Row
+                lvl={lvl()}
+                maxCum={maxCum()}
+                side="ask"
+                onClick={
+                  props.onClickLevel
+                    ? () => props.onClickLevel!(lvl().price, 'BUY')
+                    : undefined
+                }
+              />
+            )}
           </Index>
         </div>
 
@@ -141,7 +156,18 @@ export function OrderBook(props: Props) {
 
         <div class="flex flex-1 flex-col overflow-hidden">
           <Index each={bids()}>
-            {(lvl) => <Row lvl={lvl()} maxCum={maxCum()} side="bid" />}
+            {(lvl) => (
+              <Row
+                lvl={lvl()}
+                maxCum={maxCum()}
+                side="bid"
+                onClick={
+                  props.onClickLevel
+                    ? () => props.onClickLevel!(lvl().price, 'SELL')
+                    : undefined
+                }
+              />
+            )}
           </Index>
         </div>
       </Show>
@@ -149,7 +175,12 @@ export function OrderBook(props: Props) {
   )
 }
 
-function Row(props: { lvl: DisplayLevel; maxCum: number; side: 'bid' | 'ask' }) {
+function Row(props: {
+  lvl: DisplayLevel
+  maxCum: number
+  side: 'bid' | 'ask'
+  onClick?: () => void
+}) {
   const pct = () => (props.lvl.cum / props.maxCum) * 100
   const bar = () =>
     props.side === 'bid' ? 'rgba(0, 201, 114, 0.22)' : 'rgba(255, 51, 85, 0.20)'
@@ -157,7 +188,15 @@ function Row(props: { lvl: DisplayLevel; maxCum: number; side: 'bid' | 'ask' }) 
     props.side === 'bid' ? 'text-up' : 'text-down'
 
   return (
-    <div class="relative grid grid-cols-3 gap-2 px-3 py-[3px] leading-[18px]">
+    <div
+      onClick={props.onClick}
+      role={props.onClick ? 'button' : undefined}
+      title={props.onClick ? `Click to fill limit ${props.side === 'bid' ? 'SELL' : 'BUY'} at ${(props.lvl.price * 100).toFixed(2)}¢` : undefined}
+      class={
+        'relative grid grid-cols-3 gap-2 px-3 py-[3px] leading-[18px] ' +
+        (props.onClick ? 'cursor-pointer hover:bg-panel-2' : '')
+      }
+    >
       <div
         class="absolute inset-y-0 right-0"
         style={{

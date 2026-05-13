@@ -41,6 +41,11 @@ type Props = {
    *  auto-fill and market-order fill previews without hitting the network. */
   bids: () => SortedLevel[]
   asks: () => SortedLevel[]
+  /** Optional one-shot prefill, e.g. from an order-book row click. When
+   *  non-null, the form switches to limit, takes the side + outcome + price
+   *  from it, then calls `onPrefillConsumed` so the parent can clear it. */
+  prefill?: () => { price: number; side: 'BUY' | 'SELL'; outcomeIdx: number } | null
+  onPrefillConsumed?: () => void
 }
 
 /** Default slippage for market orders: 2% (matches humanplane + Polymarket UI). */
@@ -131,6 +136,19 @@ function ConnectedTradePanel(props: Props) {
     if (kind() !== 'limit') return
     const p = side() === 'BUY' ? bestAsk() : bestBid()
     if (p != null) setPriceStr((p * 100).toFixed(2))
+  })
+
+  // Consume order-book click prefill: switch to limit + matching side, snap
+  // price, and pin `userTypedPrice` so the auto-fill effect doesn't override.
+  createEffect(() => {
+    const p = props.prefill?.()
+    if (!p) return
+    userTypedPrice = true
+    setKind('limit')
+    setSide(p.side)
+    setOutcomeIdx(p.outcomeIdx)
+    setPriceStr((p.price * 100).toFixed(2))
+    props.onPrefillConsumed?.()
   })
 
   // --- USDC + approvals + safe deployment -------------------------------
