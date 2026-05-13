@@ -484,6 +484,18 @@ export const api = {
     if (!raw.length) return null
     return normalizeMarket(raw[0])
   },
+
+  getMarketByConditionId: async (
+    cid: string,
+    signal?: AbortSignal
+  ): Promise<Market | null> => {
+    const raw = await json<Record<string, unknown>[]>(
+      `/markets?condition_id=${encodeURIComponent(cid)}`,
+      signal
+    )
+    if (!raw.length) return null
+    return normalizeMarket(raw[0])
+  },
 }
 
 export type Holder = {

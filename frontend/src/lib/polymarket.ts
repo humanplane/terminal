@@ -561,6 +561,20 @@ export async function cancelOrder(orderID: string) {
 }
 
 /**
+ * One-shot cancel of every open order for the current wallet + mode. The CLOB
+ * exposes a dedicated endpoint, so this is a single L2-authed POST rather
+ * than N round-trips. Pre-existing L2 creds required (won't trigger prompts).
+ */
+export async function cancelAllOpenOrders() {
+  if (!hasCachedCreds()) throw new Error('connect wallet first')
+  const client = await getClobClient()
+  if (!client) throw new Error('wallet not connected')
+  const resp = await client.cancelAll()
+  throwIfResponseError(resp)
+  return resp
+}
+
+/**
  * Check whether the user's Polymarket Safe has been deployed on-chain.
  * New Safes don't exist until the first deposit/approval tx is relayed —
  * trying to trade from an undeployed Safe will fail at the exchange level.

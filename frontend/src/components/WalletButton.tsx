@@ -1,11 +1,26 @@
 import { Show, createSignal, onCleanup, onMount } from 'solid-js'
+import { createQuery } from '@tanstack/solid-query'
 import { useNavigate } from '@solidjs/router'
 import { connect, disconnect, setTradingMode, shortAddr, wallet } from '../lib/wallet'
+import { hasCachedCreds, listOpenOrders } from '../lib/polymarket'
+import { OpenOrdersPanel } from './OpenOrdersPanel'
 
 export function WalletButton() {
   const navigate = useNavigate()
   const [open, setOpen] = createSignal(false)
+  const [ordersPanelOpen, setOrdersPanelOpen] = createSignal(false)
   let rootEl!: HTMLDivElement
+
+  // Lightweight count poll so the header badge stays current without
+  // mounting the full panel. 20s is plenty for a count indicator.
+  const ordersCountQuery = createQuery(() => ({
+    queryKey: ['open-orders', 'all', wallet.mode(), wallet.funder()],
+    queryFn: () => listOpenOrders(),
+    enabled: hasCachedCreds() && !!wallet.funder(),
+    staleTime: 10_000,
+    refetchInterval: 20_000,
+  }))
+  const orderCount = () => ordersCountQuery.data?.length ?? 0
 
   onMount(() => {
     const onDocClick = (e: MouseEvent) => {
@@ -76,6 +91,16 @@ export function WalletButton() {
                 {wallet.safe()}
               </div>
             </div>
+            <button
+              onClick={() => {
+                setOpen(false)
+                setOrdersPanelOpen(true)
+              }}
+              class="flex w-full items-center justify-between border-b border-border-2 px-3 py-2 text-left text-[11px] hover:bg-panel-2"
+            >
+              <span>open orders</span>
+              <span class="tabular-nums text-text-dim">{orderCount()}</span>
+            </button>
             <div class="border-b border-border-2 px-3 py-2 eyebrow">
               view positions
             </div>
@@ -124,6 +149,10 @@ export function WalletButton() {
           {wallet.error()}
         </div>
       </Show>
+      <OpenOrdersPanel
+        open={ordersPanelOpen()}
+        onClose={() => setOrdersPanelOpen(false)}
+      />
     </div>
   )
 }

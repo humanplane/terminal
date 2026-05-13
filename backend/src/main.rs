@@ -165,6 +165,7 @@ struct MarketsQuery {
     volume_min: Option<f64>,
     closed: Option<bool>,
     slug: Option<String>,
+    condition_id: Option<String>,
 }
 
 async fn list_markets(
@@ -189,6 +190,10 @@ async fn list_markets(
     }
     if let Some(slug) = q.slug.as_deref().filter(|s| !s.is_empty()) {
         req = req.slug(std::iter::once(slug));
+    }
+    if let Some(cid) = q.condition_id.as_deref().filter(|s| !s.is_empty()) {
+        ensure_id(cid, 128)?;
+        req = req.condition_ids(std::iter::once(cid));
     }
 
     let markets = req.send().await?;
