@@ -2,17 +2,28 @@ import { createEffect, onCleanup, onMount } from 'solid-js'
 import {
   AreaSeries,
   createChart,
+  LineStyle,
   type IChartApi,
+  type IPriceLine,
   type ISeriesApi,
   type Time,
 } from 'lightweight-charts'
 import type { HistoryPoint } from '../lib/api'
+
+export type PriceLineSpec = {
+  price: number
+  color: string
+  title: string
+}
 
 type Props = {
   data: HistoryPoint[] | undefined
   // Optional live tick — when this changes, a new point is appended to the
   // series (or the current trailing point updated if the time matches).
   liveTick?: { t: number; p: number } | null
+  /** Horizontal reference lines (e.g. user's avg entry price). Re-applied
+   *  whenever this array's identity changes. */
+  priceLines?: PriceLineSpec[]
 }
 
 function toSeriesData(d: HistoryPoint[]) {
@@ -36,6 +47,7 @@ export function PriceChart(props: Props) {
   let series: ISeriesApi<'Area'> | null = null
   let mounted = false
   let lastTime = 0
+  let priceLines: IPriceLine[] = []
 
   const applyData = () => {
     if (!series || !props.data) return
@@ -53,6 +65,24 @@ export function PriceChart(props: Props) {
     const t = Math.max(tick.t, lastTime) as Time
     series.update({ time: t, value: tick.p })
     lastTime = Math.max(lastTime, tick.t)
+  }
+
+  const applyPriceLines = () => {
+    if (!series) return
+    for (const ln of priceLines) series.removePriceLine(ln)
+    priceLines = []
+    for (const spec of props.priceLines ?? []) {
+      priceLines.push(
+        series.createPriceLine({
+          price: spec.price,
+          color: spec.color,
+          lineStyle: LineStyle.Dashed,
+          lineWidth: 1,
+          axisLabelVisible: true,
+          title: spec.title,
+        })
+      )
+    }
   }
 
   onMount(() => {
@@ -96,6 +126,7 @@ export function PriceChart(props: Props) {
     })
 
     applyData()
+    applyPriceLines()
     mounted = true
   })
 
@@ -112,6 +143,13 @@ export function PriceChart(props: Props) {
     const tick = props.liveTick
     if (!mounted || !tick) return
     applyTick(tick)
+  })
+
+  // Re-apply reference lines when the array reference changes (e.g. user
+  // toggles wallet mode, positions change, market navigation).
+  createEffect(() => {
+    void props.priceLines
+    if (mounted) applyPriceLines()
   })
 
   onCleanup(() => {
