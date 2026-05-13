@@ -2,7 +2,7 @@ import { For, Index, Show, createEffect, createMemo, createSignal } from 'solid-
 import { createVirtualizer } from '@tanstack/solid-virtual'
 import type { Event, Market } from '../lib/api'
 import { favorites } from '../lib/favorites'
-import { fmtUSD } from '../lib/format'
+import { fmtTimeLeft, fmtUSD, liquidityTier, now } from '../lib/format'
 import { Avatar } from './Avatar'
 
 type Props = {
@@ -257,6 +257,14 @@ function EventGroup(props: {
             <span class="tabular-nums">
               {fmtUSD(props.row.event.volume24hr)} 24h
             </span>
+            <Show when={fmtTimeLeft(props.row.event.endDate, now())}>
+              {(t) => (
+                <>
+                  <span class="text-border-3">·</span>
+                  <span class="tabular-nums">{t()}</span>
+                </>
+              )}
+            </Show>
           </div>
         </div>
       </button>
@@ -315,6 +323,19 @@ function MarketRow(props: {
   const yesPrice = () => props.market.outcomePrices[0] ?? null
   const change = () => props.market.oneDayPriceChange ?? 0
   const fav = () => favorites.isMarket(props.market.id)
+  const tier = () => liquidityTier(props.market)
+  const tierTitle = () =>
+    tier() === 'thick'
+      ? 'Tight book, deep liquidity'
+      : tier() === 'mid'
+        ? 'Moderate liquidity'
+        : 'Thin / illiquid book'
+  const tierClass = () =>
+    tier() === 'thick'
+      ? 'text-up'
+      : tier() === 'mid'
+        ? 'text-text'
+        : 'text-text-dim'
   return (
     <button
       onClick={props.onClick}
@@ -337,6 +358,13 @@ function MarketRow(props: {
           <Show when={fav()}>
             <span class="text-[9px] text-text-bright">★</span>
           </Show>
+          <span
+            class={`text-[8px] leading-none ${tierClass()}`}
+            title={tierTitle()}
+            aria-label={tierTitle()}
+          >
+            ●
+          </span>
           <div class="truncate text-[11px] text-text">
             {props.market.groupItemTitle || props.market.question}
           </div>
