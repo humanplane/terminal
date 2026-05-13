@@ -320,8 +320,17 @@ post-only, or set your price within the spread.
   explicit about what's happening — which txs, what cost, whether your
   Safe is being deployed. No hidden auto-approvals. Values are `MaxUint256`
   to match polymarket.com's behavior.
-- **CORS**: backend defaults to `CorsLayer::permissive()` (no credentials).
-  Fine for personal / self-hosted use. Tighten for multi-tenant deploys.
+- **CORS**: backend has no CORS layer by default — Vite proxies `/api`
+  server-side in dev, so no preflight is needed. If you serve the frontend
+  from a different origin than the backend, set `CORS_ORIGINS=https://your-app`
+  (comma-separated for multiple). `CORS_ORIGINS=*` re-enables the old
+  permissive behavior and logs a startup warning.
+- **L2 credentials in `localStorage`.** The Polymarket CLOB `key/secret/passphrase`
+  (used for read endpoints like open orders) is cached unencrypted in
+  `localStorage` so polling doesn't trigger signature prompts. Funds are
+  unaffected — placing orders still requires an EOA signature — but any
+  XSS could place/cancel orders on your behalf. Only run this app from
+  hosts you trust.
 
 ## Known limitations
 
