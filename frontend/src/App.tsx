@@ -30,7 +30,9 @@ import { MarketDetail } from './components/MarketDetail'
 import { TraderList } from './components/TraderList'
 import { TraderDetail } from './components/TraderDetail'
 import { WalletButton } from './components/WalletButton'
+import { ToastContainer } from './components/ToastContainer'
 import { initWalletAutoReconnect } from './lib/wallet'
+import { initAlerts } from './lib/alerts'
 
 const PAGE_SIZE = 250
 const LEADERBOARD_PAGE = 50
@@ -45,6 +47,8 @@ export default function Shell(props: { children?: JSX.Element }) {
 
   // Silently reconnect the wallet if the user authorized us in a prior session.
   initWalletAutoReconnect()
+  // Hydrate price-alert state and start the polling loop.
+  onMount(() => initAlerts())
 
   const mode = (): Mode =>
     location.pathname.startsWith('/trader') ? 'traders' : 'markets'
@@ -364,6 +368,8 @@ export default function Shell(props: { children?: JSX.Element }) {
           <WalletButton />
         </div>
       </header>
+
+      <ToastContainer />
 
       <div class="flex min-h-0 flex-1">
         <aside class="flex w-[380px] shrink-0 flex-col border-r border-border-2">
