@@ -23,7 +23,11 @@ use polyoxide_data::types::TimePeriod;
 use polyoxide_gamma::Gamma;
 use serde::Deserialize;
 use tokio_stream::wrappers::ReceiverStream;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use axum::http::HeaderValue;
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    trace::TraceLayer,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -80,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/user/:addr/trades", get(user_trades))
         .route("/api/user/:addr/activity", get(user_activity))
         .with_state(state)
-        .layer(CorsLayer::permissive())
+        .layer(build_cors_layer())
         // Hard cap per request — upstream SDK has its own 15s timeout but
         // axum needs its own, otherwise a stuck upstream pins the tower task.
         .layer(TimeoutLayer::new(Duration::from_secs(20)))
@@ -103,6 +107,37 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// CORS policy from `CORS_ORIGINS` (comma-separated origins, or `*`).
+/// Unset → no CORS layer (fine for dev: Vite proxies `/api` server-side).
+/// `*` → permissive (back-compat; logs a warning).
+/// Otherwise → strict allowlist of the listed origins.
+fn build_cors_layer() -> CorsLayer {
+    let raw = std::env::var("CORS_ORIGINS").unwrap_or_default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return CorsLayer::new();
+    }
+    if trimmed == "*" {
+        tracing::warn!(
+            "CORS_ORIGINS=* — backend is an open relay. Set explicit origins in production."
+        );
+        return CorsLayer::permissive();
+    }
+    let origins: Vec<HeaderValue> = trimmed
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match HeaderValue::from_str(s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("ignoring invalid CORS origin {s:?}: {e}");
+                None
+            }
+        })
+        .collect();
+    CorsLayer::new().allow_origin(AllowOrigin::list(origins))
 }
 
 /// Accept only the shapes Polymarket ids come in — avoids forwarding
@@ -312,7 +347,16 @@ async fn stream_book(
                 Ok(mut ws) => {
                     attempts = 0;
                     backoff = Duration::from_secs(1);
-                    while let Some(msg) = ws.next().await {
+                    // Loop on the WS stream but also wake up if the SSE
+                    // receiver is dropped (client disconnect). Without the
+                    // select, a silent upstream + dead client leaves the
+                    // task parked in `ws.next()` forever.
+                    let disconnected = loop {
+                        let msg = tokio::select! {
+                            _ = tx.closed() => return,
+                            m = ws.next() => m,
+                        };
+                        let Some(msg) = msg else { break false };
                         let payload = match msg {
                             Ok(Channel::Market(MarketMessage::Book(b))) => {
                                 serde_json::json!({ "type": "book", "data": b })
@@ -329,7 +373,7 @@ async fn stream_book(
                             Ok(_) => continue,
                             Err(e) => {
                                 tracing::warn!("ws msg error: {e}");
-                                break;
+                                break false;
                             }
                         };
                         let event = match Event::default().json_data(payload) {
@@ -340,8 +384,11 @@ async fn stream_book(
                             }
                         };
                         if tx.send(event).await.is_err() {
-                            return;
+                            break true;
                         }
+                    };
+                    if disconnected {
+                        return;
                     }
                 }
                 Err(e) => {
@@ -354,7 +401,11 @@ async fn stream_book(
                     );
                 }
             }
-            tokio::time::sleep(backoff).await;
+            // Also bail during reconnect backoff if the client has gone.
+            tokio::select! {
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     });
